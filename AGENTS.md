@@ -1,10 +1,17 @@
-# XTE-IPTV 直播代理 (FPK) v5.0
+# XTE-IPTV 直播代理 (FPK) v5.0.1
 
 ## 项目概览
 飞牛 NAS 上的 IPTV 直播代理服务。输出标准 HLS (m3u8 + TS)，无转码。
-- **v5.0（当前）：修复 PC 飞牛内置播放器转圈圈 + 频道导出体验微调 + 大版本号升级**
-  - **① 修复内置播放器转圈（优先级反转 bug，核心）**：日志（log26）显示 PC 飞牛桌面端（Electron，`terminal="Windows浏览器"`）看 CCTV1/太原1 时持续转圈，而 v4.1.2 不转。根因：`servePlaylist` 首载时 `warmPrefetch` 以**低优先级(priority=1)后台预取**第 0 片，播放器随后请求同一片时 `streamSegmentToClient → fetchSegment` 命中 `streaming` Map 里已在途的预取下载，**直接复用了那条仍按优先级 1 排队/运行的低优先级连接**——当 6 个回源槽位占满时它被当作最低优先级限速/排队，播放器干等（log26 证据：`分片首包到达 ttfbMs:1774, catchupBytes:3248960` 说明播放器请求时预取已偷下 3.2MB，但整片仍以预取优先级耗时 3.9s）。v4.1.2 无 DOWNLOAD_SCHED 调度器、所有回源同优先级直接发，故无此反转。修复：`fetchSegment(url, prefetch=false)` 命中一条「`inflight.prefetch===true` 且 `streamers===0`（尚无播放器挂载）且未结束」的在途下载时，中止该低优先级预取（destroy 上游）并以播放器优先级(priority=10)重新回源；已有播放器在看(streamers>0)的实时流正常复用（共享 + catch-up 补发）。`inflight` 新增 `prefetch` 标记位。
-  - **② 频道导出按钮文案精简**：批量栏「导出列表」改为「导出」（2 字）；「导出选中」只导出勾选频道的行为不变。其余 v4.1.9 全部功能不改动。
+- **v5.0.1（当前）：紧急修复 v5.0 导致所有终端转圈 + 回退对齐 v4.1.2 稳定内核**
+  - **① 修复 v5.0 致命 bug（核心，所有终端转圈的根因）**：v5.0 在 `fetchSegment` 开头加了「优先级提权」逻辑——当播放器按需请求(`prefetch=false`)命中一条「纯后台预取、尚无播放器挂载(`streamers===0`)」的在途下载时，`destroy()` 该预取上游、删除 inflight、再以高优先级(priority=10)从头重新下载。实测（log28 铁证）这会把**每个**预取分片在播放器请求时销毁，已下载的几 MB 全部丢弃：全程 `prefetched:0`、`miss` 持续增长(1→11)、`hit` 仅 1-3、`slowClient` 频繁、`state` 变 `stalled`，每片 10MB 以 ~1900KB/s 冷启动耗时 5-8s（≈分片时长），播放器每片都干等→**飞牛内置播放器、手机、电视等所有终端转圈**。对比 v4.1.2（log27）：`prefetched` 正常增长 0→3、`buffered` 稳步爬升、无 slowClient、state 始终 playing。
+  - **修复方式（回退对齐 v4.1.2）**：
+    1. `fetchSegment` 移除 abort/restart 提权块，恢复为 `if (existing) return existing.promise;`——播放器命中在途下载（含预取）一律复用，由 `streamSegmentToClient` 的 catch-up 补发已缓冲 chunks（这正是 v4.1.2 的正确行为，log27 中 `catchupBytes:590720/6679680` 证明补发有效）。
+    2. 所有回源（播放器流 + 预取）**直接 `fetchUpstream`**，不再经 `DOWNLOAD_SCHED.submit()` 排队/抢占——调度器在单路/少量终端场景会让预取在 6 槽位逻辑中被反复抢占/中止，反而把预取饿死。同一会话内串行预取 + 在途去重(streaming Map)已足够控制带宽突发。
+    3. 分片超时恢复为 v4.1.2 的 `(targetDuration*1000)||12000`（约 10s，有数据持续到达会自动重置），不再用 30s。
+    4. 移除 `prefetchMaxViewers` 全局观看会话数门控（`_prefetchAllowed` 只看本会话 `hasRecentViewer()`）——该计数在某些场景会把唯一真实会话也误判为多路而关预取。大分片自适应深度(`_prefetchDepth`，4K 只预取1片)保留。
+    5. `inflight` 移除 `prefetch` 标记位。
+  - **② 保留 v5.0 功能**：批量栏「导出列表」改为「导出」（2 字）；「导出选中」只导出勾选频道的行为不变；导出 M3U 功能全部保留。
+- **v5.0（已撤回，存在致命 bug）**：曾试图修复 PC 内置播放器转圈（误判为「优先级反转」），引入了上述 abort/restart 提权逻辑，结果导致预取被全部杀死、所有终端转圈。切勿使用 v5.0 的 fpk，升级到 v5.0.1。
 - **v4.1.9：多设备同时卡顿治理 + 频道导出功能**
   - **① 全局回源并发 3→6（可配置 `maxConcurrentUpstreams`，默认 6）**：日志（log24）显示 5 设备同看（4 路 4K + 1 路 1080P）时，`maxConcurrent=3` 槽位不足，实时流排队等下载，表现为「5 个要卡会同时卡」。对比 v4.1.2（git `35a7457`）发现它**根本没有 DOWNLOAD_SCHED 调度器**，直接回源所以不卡。v4.1.9 把槽位提到 6（≥ 常见家庭并发终端数），保留播放器优先于预取的抢占逻辑。
   - **② 分片回源超时 10s→30s（`segmentUpstreamTimeoutMs`，默认 30000）**：北京卫视 4K 分片达 50-54MB，带宽争抢时单片下载 10-19s，旧硬超时（`targetDuration*1000`≈10s）会 abort 共享回源，导致同一 session 下所有客户端同时断流（log24 `fail:22`、`consecutiveFail:3/4`）。放宽到 30s 给大分片足够时间，避免误杀正常下载。
@@ -42,11 +49,11 @@
 | segRetry | 3 | 单分片失败重试次数 |
 | segRetryIntervalMs | 500 | 重试间隔 |
 | prefetchMemLimitMB | 1100 | 预取全局内存闸门(MB)，超过才暂停预取（v4.1.8 从硬编码 600 提升） |
-| prefetchMaxViewers | 1 | 真实观众会话数 > 此值时各路关闭预取，把带宽让给实时流（v4.1.9 新增，多路 4K 不互抢） |
-| maxConcurrentUpstreams | 6 | 全局回源并发上限（v4.1.9 从 3 提升；旧值在 5 设备同看时排队集体卡）。映射到 DOWNLOAD_SCHED.maxConcurrent |
-| segmentUpstreamTimeoutMs | 30000 | 单片回源超时(ms)（v4.1.9 新增；旧硬超时≈targetDuration*1000=10s 会误杀 54MB 的 4K 大分片并 abort 共享回源） |
+| ~~prefetchMaxViewers~~ | 已移除 | v5.0.1 移除：该全局观看会话数门控会误饿单路预取。现仅按本会话 hasRecentViewer() 判定 |
+| ~~maxConcurrentUpstreams~~ | 6（已不用于分片回源） | v5.0.1 起分片回源直接 fetchUpstream，不再经 DOWNLOAD_SCHED；该值仅残留于配置/状态展示 |
+| segmentUpstreamTimeoutMs | targetDuration*1000≈10s | v5.0.1 回退对齐 v4.1.2（v4.1.9 曾放宽到 30s，但绕过调度器后无需）。socket 无数据静默超时，有数据到达自动重置 |
 | stalledRecoverMs | 60000 | stalled 自动恢复：有连接但超此时长无分片送达即断开重连（v4.1.7，0=关闭） |
-| DOWNLOAD_SCHED.maxConcurrent | 6 | 全局回源并发上限（播放器优先于预取；v4.1.9 起取 maxConcurrentUpstreams） |
+| DOWNLOAD_SCHED | 定义保留但分片回源不再使用 | v5.0.1 起 fetchSegment 直接 fetchUpstream，调度器对象保留仅为兼容状态接口/历史代码，不再排队或抢占 |
 | KEEP_AGENT | maxSockets=128/maxFreeSockets=32/timeout=60000 | HTTP keep-alive 连接池（v4.1.4 已移除背压 8s 强杀，改为背压 pause/resume） |
 
 
