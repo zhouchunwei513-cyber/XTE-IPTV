@@ -1,0 +1,149 @@
+#!/bin/bash
+# XTE 生命周期脚本：启动/停止/状态
+# fnOS 运行时注入：
+#   TRIM_APPDEST       应用安装目录（server/main.js 所在）
+#   TRIM_PKGVAR        应用可变数据目录
+#   TRIM_SERVICE_PORT  服务端口（manifest service_port=34500）
+#   TRIM_TEMP_LOGFILE  启动失败时回显给界面的日志
+
+LOG_FILE="${TRIM_PKGVAR}/info.log"
+PID_FILE="${TRIM_PKGVAR}/app.pid"
+
+DATA_DIR="${TRIM_PKGVAR}/data"
+mkdir -p "${DATA_DIR}" 2>/dev/null
+
+# 选择 Node.js（fnOS 应用中心提供 nodejs_v16/v18/v20/v22；需要 16+ 以支持现代语法）
+pick_node() {
+    if command -v node >/dev/null 2>&1; then
+        command -v node
+        return 0
+    fi
+    for v in nodejs_v22 nodejs_v20 nodejs_v18 nodejs_v16; do
+        local p="/var/apps/${v}/target/bin/node"
+        if [ -x "$p" ]; then echo "$p"; return 0; fi
+    done
+    return 1
+}
+
+NODE_BIN="$(pick_node)"
+SERVER_JS="${TRIM_APPDEST}/server/main.js"
+SERVICE_PORT="${TRIM_SERVICE_PORT:-34500}"
+
+log_msg() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}" 2>/dev/null
+}
+
+# 检测端口是否已在监听（IPv4/IPv6 双栈）
+port_listening() {
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltn 2>/dev/null | grep -qE "[:.]${SERVICE_PORT}[[:space:]]" && return 0
+    fi
+    if command -v netstat >/dev/null 2>&1; then
+        netstat -ltn 2>/dev/null | grep -qE "[:.]${SERVICE_PORT}[[:space:]]" && return 0
+    fi
+    # /dev/tcp 兜底
+    (exec 3<>"/dev/tcp/127.0.0.1/${SERVICE_PORT}") 2>/dev/null && { exec 3>&-; return 0; }
+    return 1
+}
+
+start_process() {
+    if status; then
+        log_msg "already running pid=$(head -n 1 "${PID_FILE}" 2>/dev/null)"
+        return 0
+    fi
+    if [ -z "${NODE_BIN}" ]; then
+        echo "未找到 Node.js 运行时，请先在飞牛应用中心安装 Node.js（nodejs_v18 或更高版本）" > "${TRIM_TEMP_LOGFILE}"
+        log_msg "node runtime not found"
+        return 1
+    fi
+    if [ ! -f "${SERVER_JS}" ]; then
+        echo "服务文件不存在：${SERVER_JS}" > "${TRIM_TEMP_LOGFILE}"
+        log_msg "server file not found: ${SERVER_JS}"
+        return 1
+    fi
+
+    log_msg "Starting XTE node=${NODE_BIN} port=${SERVICE_PORT} DATA_DIR=${DATA_DIR}"
+
+    # 后台常驻：崩溃后 3 秒自动重启；node 直接在该 shell 中运行，
+    # PID 文件记录守护 shell 的 PID，停止时杀整个进程组。
+    nohup bash -c '
+        NODE_BIN="$1"; SERVER_JS="$2"; LOG_FILE="$3"; DATA_DIR="$4"; SERVICE_PORT="$5"
+        while true; do
+            echo "$(date "+%Y-%m-%d %H:%M:%S") - [guard] spawn node" >> "$LOG_FILE"
+            DATA_DIR="$DATA_DIR" TRIM_SERVICE_PORT="$SERVICE_PORT" FPK_SERVICE_PORT="$SERVICE_PORT" PORT="$SERVICE_PORT" \
+                "$NODE_BIN" "$SERVER_JS" >> "$LOG_FILE" 2>&1
+            echo "$(date "+%Y-%m-%d %H:%M:%S") - [guard] node exited, restart in 3s" >> "$LOG_FILE"
+            sleep 3
+        done
+    ' _ "${NODE_BIN}" "${SERVER_JS}" "${LOG_FILE}" "${DATA_DIR}" "${SERVICE_PORT}" >> "${LOG_FILE}" 2>&1 &
+
+    GUARD_PID=$!
+    echo "${GUARD_PID}" > "${PID_FILE}"
+
+    # 等待端口起来（最多 15 秒）
+    local i=0
+    while [ $i -lt 15 ]; do
+        sleep 1
+        i=$((i + 1))
+        if port_listening; then
+            log_msg "XTE is listening on port ${SERVICE_PORT} (guard pid=${GUARD_PID})"
+            return 0
+        fi
+        # 守护进程提前退出说明启动失败
+        if ! kill -0 "${GUARD_PID}" 2>/dev/null; then
+            log_msg "guard exited before port ready"
+            echo "服务启动失败，详情见日志：${LOG_FILE}" > "${TRIM_TEMP_LOGFILE}"
+            tail -n 20 "${LOG_FILE}" 2>/dev/null >> "${TRIM_TEMP_LOGFILE}"
+            rm -f "${PID_FILE}"
+            return 1
+        fi
+    done
+
+    log_msg "WARN: port ${SERVICE_PORT} not detected within 15s (ss/netstat may be unavailable)"
+    # checkport 由系统判定；即使没探测到端口，只要 node 还在跑也视为成功
+    if kill -0 "${GUARD_PID}" 2>/dev/null; then return 0; fi
+    echo "服务启动超时，详情见日志：${LOG_FILE}" > "${TRIM_TEMP_LOGFILE}"
+    tail -n 20 "${LOG_FILE}" 2>/dev/null >> "${TRIM_TEMP_LOGFILE}"
+    rm -f "${PID_FILE}"
+    return 1
+}
+
+stop_process() {
+    log_msg "Stopping XTE ..."
+    if [ -r "${PID_FILE}" ]; then
+        local pid
+        pid=$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')
+        if kill -0 "${pid}" 2>/dev/null; then
+            # 杀整个进程组（守护 shell + node 子进程）
+            kill -TERM "-${pid}" 2>/dev/null || kill -TERM "${pid}" 2>/dev/null
+            local count=0
+            while kill -0 "${pid}" 2>/dev/null && [ $count -lt 8 ]; do
+                sleep 1; count=$((count + 1))
+            done
+            if kill -0 "${pid}" 2>/dev/null; then
+                kill -KILL "-${pid}" 2>/dev/null || kill -KILL "${pid}" 2>/dev/null
+            fi
+        fi
+        rm -f "${PID_FILE}"
+    fi
+    # 兜底：清理残留 node 进程
+    pkill -f "${SERVER_JS}" 2>/dev/null
+    return 0
+}
+
+status() {
+    if [ -f "${PID_FILE}" ]; then
+        local pid
+        pid=$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')
+        if kill -0 "${pid}" 2>/dev/null; then return 0; fi
+        rm -f "${PID_FILE}"
+    fi
+    return 1
+}
+
+case $1 in
+    start)  start_process ;;
+    stop)   stop_process ;;
+    status) if status; then exit 0; else exit 3; fi ;;
+    *)      exit 1 ;;
+esac

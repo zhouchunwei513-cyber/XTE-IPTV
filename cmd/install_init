@@ -1,0 +1,5 @@
+#!/bin/bash
+# XTE 安装后初始化：保证内置 FFmpeg 可执行
+set -e
+chmod +x "${TRIM_APPDEST}/bin/ffmpeg" 2>/dev/null || true
+exit 0

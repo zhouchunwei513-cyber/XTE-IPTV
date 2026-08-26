@@ -1,0 +1,15 @@
+appname               = xte
+version               = 5.0
+display_name          = XTE
+desc                  = XTE-IPTV v5.0：IPTV 直播源统一管理与智能代理。①集中管理 IPTV 源——远程 URL、本地上传、文本粘贴多方式导入，频道台标/名称/分组/TVG-ID 可视化编辑、批量启停/分组/删除，一键导出标准 M3U（仅导出选中、当前列表或全部，含内网代理/三线路合并/原始地址）。②解决直播源跨运营商、跨省卡顿——内置智能缓冲内核，分片预取、失败重试、坏片自动跳过，弱网与跨网持续流畅；修复 PC 飞牛内置播放器转圈问题（预取分片被播放器请求时自动提权为实时流高优先级，不再被低优先级后台下载拖慢）；三线路（内网/IPv6/FRP）自动适配，手机/平板/电视/电脑各类终端都能看。③无转码、零第三方依赖，原生 Node.js，轻量稳定。
+arch                  = x86_64
+platform              = x86
+source                = thirdparty
+maintainer            = XTE
+distributor           = XTE
+os_min_version        = 0.9.27
+service_port          = 34500
+checkport             = true
+ctl_stop              = true
+desktop_uidir         = ui
+desktop_applaunchname = xte.Application

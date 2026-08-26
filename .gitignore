@@ -1,0 +1,14 @@
+# 运行时数据与日志
+data/
+*.log
+
+# 构建产物 / 打包
+dist/
+*.fpk
+!app/ui/images/*.png
+
+# 系统/编辑器
+.DS_Store
+Thumbs.db
+*.swp
+node_modules/

@@ -1,0 +1,32 @@
+#!/bin/sh
+# XTE FPK uninstall hook
+# 卸载时彻底清除所有文件：应用程序 + 用户数据
+
+set +e
+
+APP_DIR="/vol3/@appcenter/xte"
+DATA_DIR="/vol3/@appdata/xte"
+DATA_DIR2="/vol1/@appdata/xte"
+
+echo "[XTE] 开始卸载清理..."
+
+# 停止服务
+pkill -f "xte/server/main.js" 2>/dev/null
+sleep 1
+
+# 清除应用程序目录（旧代码残留）
+if [ -d "$APP_DIR" ]; then
+    rm -rf "$APP_DIR"
+    echo "[XTE] 已清除应用程序目录: $APP_DIR"
+fi
+
+# 清除用户数据目录（所有卷）
+for d in "$DATA_DIR" "$DATA_DIR2"; do
+    if [ -d "$d" ]; then
+        rm -rf "$d"
+        echo "[XTE] 已清除数据目录: $d"
+    fi
+done
+
+echo "[XTE] 卸载清理完成"
+exit 0

@@ -1,0 +1,12 @@
+{
+    "data-share": {
+        "shares": [
+            {
+                "name": "xte",
+                "permission": {
+                    "rw": ["xte"]
+                }
+            }
+        ]
+    }
+}

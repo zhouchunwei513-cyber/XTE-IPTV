@@ -1,0 +1,13 @@
+{
+    ".url": {
+        "xte.Application": {
+            "title": "XTE",
+            "icon": "images/icon_{0}.png",
+            "type": "iframe",
+            "protocol": "http",
+            "port": "34500",
+            "url": "/",
+            "allUsers": true
+        }
+    }
+}
