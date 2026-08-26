@@ -1,8 +1,12 @@
-# XTE-IPTV 直播代理 (FPK) v5.0.1
+# XTE-IPTV 直播代理 (FPK) v5.0.2
 
 ## 项目概览
 飞牛 NAS 上的 IPTV 直播代理服务。输出标准 HLS (m3u8 + TS)，无转码。
-- **v5.0.1（当前）：紧急修复 v5.0 导致所有终端转圈 + 回退对齐 v4.1.2 稳定内核**
+- **v5.0.2（当前）：修复电视/平板/手机等非 PC 终端不能看**
+  - **① 非 PC 终端不能看的根因（核心）**：v5.0.1 PC（飞牛桌面端）已不卡，但用户反馈电视盒子、平板、手机不能看。日志（log29）显示太原1会话 `prefetched` 0→24、`hit` 0→21、state 始终 playing，**但全程只有 `terminal":"Windows浏览器"`（192.168.31.1）的请求，没有任何移动/电视终端命中**。对比 v4.1.2（git `35a7457`）发现：v4.1.3 起把「观众活动窗口」`activeWindowMs` 从 **45000ms 缩短到 20000ms**、「会话空闲 TTL」`sessionTtlMs` 从 **90000ms 缩短到 30000ms**。PC 飞牛桌面端每 ~4s 轮询一次 m3u8，从不会超过 20s，所以正常；但电视盒子/平板/手机的 IPTV 播放器会**一次性缓冲多个分片、静默播放 30~60s 后才发下一个请求**，这期间 `reapSessions()` 判定 `idleMs > 20s && active<=0`，把会话误判为「观众已切走」而 `s.destroy()` 回收、清空缓冲；播放器下次取片时只能冷启动/重建，表现为非 PC 终端转圈、不能看。
+  - **修复（回退对齐 v4.1.2）**：`activeWindowMs` 恢复 **45000ms**，`sessionTtlMs` 恢复 **90000ms**。启动时对旧持久化配置做迁移（即使 config.json 里存了 20000/30000，也强制抬到 45s/90s 下限），覆盖所有已安装环境。
+  - 保留 v5.0 导出功能、v5.0.1 在途下载复用修复（PC 不卡）。
+- **v5.0.1：紧急修复 v5.0 导致所有终端转圈 + 回退对齐 v4.1.2 稳定内核**
   - **① 修复 v5.0 致命 bug（核心，所有终端转圈的根因）**：v5.0 在 `fetchSegment` 开头加了「优先级提权」逻辑——当播放器按需请求(`prefetch=false`)命中一条「纯后台预取、尚无播放器挂载(`streamers===0`)」的在途下载时，`destroy()` 该预取上游、删除 inflight、再以高优先级(priority=10)从头重新下载。实测（log28 铁证）这会把**每个**预取分片在播放器请求时销毁，已下载的几 MB 全部丢弃：全程 `prefetched:0`、`miss` 持续增长(1→11)、`hit` 仅 1-3、`slowClient` 频繁、`state` 变 `stalled`，每片 10MB 以 ~1900KB/s 冷启动耗时 5-8s（≈分片时长），播放器每片都干等→**飞牛内置播放器、手机、电视等所有终端转圈**。对比 v4.1.2（log27）：`prefetched` 正常增长 0→3、`buffered` 稳步爬升、无 slowClient、state 始终 playing。
   - **修复方式（回退对齐 v4.1.2）**：
     1. `fetchSegment` 移除 abort/restart 提权块，恢复为 `if (existing) return existing.promise;`——播放器命中在途下载（含预取）一律复用，由 `streamSegmentToClient` 的 catch-up 补发已缓冲 chunks（这正是 v4.1.2 的正确行为，log27 中 `catchupBytes:590720/6679680` 证明补发有效）。
@@ -43,8 +47,8 @@
 | prefetchAhead | 3 | 当前片之后串行预取 3 片 |
 | refreshMinIntervalMs | 3000 | m3u8 回源节流最小间隔 |
 | keepAliveIntervalMs | 4000 | 保活定时器周期（只刷新索引） |
-| activeWindowMs | 20000 | 最近有真实观众的时间窗，门控后台预取/保活 |
-| sessionTtlMs | 30000 | 空闲会话 30s 回收（按 lastClientAt 真实观众） |
+| activeWindowMs | 45000 | 最近有真实观众的时间窗（v5.0.2 从20s回退到v4.1.2的45s；电视/平板缓冲30~60s才发下一请求，20s会误回收会话） |
+| sessionTtlMs | 90000 | 空闲会话回收 90s（v5.0.2 从30s回退到v4.1.2的90s；启动时对旧配置强制迁移到≥90s） |
 | segmentTtlMs | 45000 | 分片缓存 45s |
 | segRetry | 3 | 单分片失败重试次数 |
 | segRetryIntervalMs | 500 | 重试间隔 |
