@@ -42,7 +42,7 @@ function toAsciiHost(input) {
   return s;
 }
 
-const APP_VERSION = '5.0';
+const APP_VERSION = '5.0.1';
 
 // ---------------------------------------------------------------------------
 // 路径与配置
@@ -945,14 +945,12 @@ class SegmentSession {
 
   // 单路后台预取：_prefRunning 作为「是否有预取在跑」的闸门，保证同一时刻最多 1 路预取回源，
   // 不会与播放器流形成多路 10MB 突发；而在途去重(streaming Map)保证同一片绝不重复下载。
-  // v4.1.9 预取自适应：①多路并发观看(>prefetchMaxViewers)时各路都不预取，把出口带宽全部
-  //   让给实时流——实测2-3路4K(54MB/片)并发时，预取的大分片会与播放器当前片争抢带宽，
-  //   触发10s超时打断正在播的分片；单路时预取仍积极消峰填谷。②大分片(4K)只预取1片，
-  //   小分片(高清)按 prefetchAhead 深度预取，避免54MB大分片额外占带宽。
+  // v5.0.1 回退对齐 v4.1.2：只要本会话有最近观众就积极预取，不再按「全局同时观看会话数」门控。
+  //   v4.1.3+ 曾加 prefetchMaxViewers(>1 路并发就关预取)，但日志(log28)显示在某些场景该计数
+  //   会把唯一真实会话也误判为多路，导致 prefetched 永远为 0、每片冷启动转圈。v4.1.2 无此门控、
+  //   单/多路都流畅，故移除。大分片自适应深度(4K 只预取1片)保留，避免 54MB 分片额外占带宽。
   _prefetchAllowed() {
     if (this.destroyed || !this.hasRecentViewer()) return false;
-    const viewers = countActiveViewers();
-    if (viewers > (config.prefetchMaxViewers || 1)) return false;
     return true;
   }
   _prefetchDepth() {
@@ -968,16 +966,15 @@ class SegmentSession {
         const url = this._prefQueue.shift();
         const key = segKey(url);
         if (this.segs.has(key) || this.streaming.has(key) || this.badKeys.has(key)) continue;
-        // 每取一片都重新评估：观众数/内存/并发槽位可能在下载期间变化
+        // 每取一片都重新评估：观众可能已切走
         if (!this._prefetchAllowed()) { this._prefQueue = []; break; }
-        // 全局保护：播放器流占满并发槽位时，预取退让（让调度器优先服务实时流）；
-        // 内存过高（多为 4K 大分片堆积）时也暂停预取，避免 OOM。
-        // 闸门用可配置的 prefetchMemLimitMB（默认1100MB）。旧值硬编码600MB会
-        // 让单路4K会话(正常RSS≈638MB)的预取被永久饿死——prefetched 永远为0，播放器
-        // 每片都冷启动等待5s回源，表现为频繁卡顿。
+        // 全局保护：内存过高（多为 4K 大分片堆积）时暂停预取，避免 OOM。
+        // 闸门用可配置的 prefetchMemLimitMB（默认1100MB）。
+        // v5.0.1：移除「播放器流占满并发槽位就退让」的判断——fetchSegment 已不再经过
+        // DOWNLOAD_SCHED，activeCount 不再反映回源负载；该判断在单路场景会误饿预取。
         const memMB = process.memoryUsage().rss / 1024 / 1024;
         const memLimit = (config.prefetchMemLimitMB > 0 ? config.prefetchMemLimitMB : 1100);
-        if (DOWNLOAD_SCHED.activeCount() >= DOWNLOAD_SCHED.maxConcurrent || memMB > memLimit) {
+        if (memMB > memLimit) {
           this._prefQueue.unshift(url); // 放回队首，稍后重试
           break;
         }
@@ -1039,27 +1036,18 @@ class SegmentSession {
   fetchSegment(url, prefetch) {
     const key = segKey(url);
     const existing = this.streaming.get(key);
-    // 优先级提权（修复 PC 内置播放器转圈圈）：播放器按需请求(prefetch=false)命中了一条
-    // 「纯后台预取、且尚无任何播放器挂载消费」的在途下载时，不能复用这条低优先级(priority=1)
-    // 连接——它在 6 槽位占满时会被当作最低优先级排队/限速，导致播放器干等转圈（日志 log26：
-    // 播放器请求时预取已偷下 3.2MB，但整片仍以预取优先级耗时 3.9s）。此时中止该预取、以
-    // 播放器优先级(priority=10)重新回源。已有播放器在看(streamers>0)说明它本就是实时流，
-    // 正常复用即可（共享同一条回源 + catch-up 补发）。v4.1.2 无调度器、所有回源同优先级，
-    // 故无此反转。
-    if (existing && !prefetch && existing.prefetch && existing.streamers === 0 && existing.upstream && !existing.finished) {
-      existing.aborted = true;
-      try { existing.upstream.destroy(); } catch {}
-      this.streaming.delete(key);
-      // 落到下方以高优先级重建
-    } else if (existing) {
-      return existing.promise;
-    }
+    // v5.0.1 关键修复（回退对齐 v4.1.2）：播放器请求命中一条在途下载（无论是预取还是实时流）
+    // 时，一律复用同一条回源连接，由 streamSegmentToClient 的 catch-up 补发已缓冲数据。
+    // 绝不能 abort 重启——v5.0 曾在这里对「纯预取在途」做优先级提权（destroy 上游再以高优先级
+    // 重建），结果每个预取分片在播放器请求时被销毁、已下载的几 MB 全部丢弃，prefetched 永远
+    // 为 0、每片都冷启动等 5~8s 回源，导致所有终端转圈卡顿（log28 铁证）。v4.1.2 无调度器、
+    // 所有回源直接 fetchUpstream 同优先级，靠在途复用 + catch-up 即流畅（log27）。
+    if (existing) return existing.promise;
     const t0 = Date.now();
     const inflight = {
       streamers: 0, chunks: [], bytes: 0, aborted: false, finished: false,
       clients: [], contentType: 'video/mp2t', startedAt: t0, slowClient: false,
       resolve: null, reject: null, promise: null, upstream: null,
-      prefetch: !!prefetch,
     };
     inflight.promise = new Promise((resolve, reject) => {
       inflight.resolve = resolve;
@@ -1067,30 +1055,13 @@ class SegmentSession {
     });
     this.streaming.set(key, inflight);
 
-    // 播放器实时流优先级 10；后台预取优先级 1。
-    // 经全局调度器限流，多个会话的大分片（尤其 4K 60MB/片）不会同时回源打爆出口带宽。
-    const priority = prefetch ? 1 : 10;
-    const queuedAt = Date.now();
-    DOWNLOAD_SCHED.submit(priority, (abortSignal) => {
-      if (abortSignal && abortSignal.aborted) {
-        return Promise.reject(new Error('preempted before start'));
-      }
-      return fetchUpstream(url, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (XTE-IPTV/4.1; +native-hls)' },
-        // 分片回源超时：4K 大分片(54MB)在多路并发争抢带宽时，数据间歇可能超过一个分片
-        // 时长(10s)才到下一块，旧值 targetDuration*1000≈10s 会误判超时、abort 正在播放的
-        // 分片(日志中的「回源请求超时→分片流式传输中断 aborted」)。放宽到 30s：这是 socket
-        // 无数据静默超时（有数据持续到达会自动重置），真正卡死的连接 30s 也能断开；配合
-        // 背压 pause/resume 不会把内存撑爆。
-        timeoutMs: config.segmentUpstreamTimeoutMs || 30000,
-      }).then((r) => {
-        // 预取被高优先级播放器请求抢占：销毁这条上游连接，立即让出带宽槽位
-        if (prefetch && abortSignal && abortSignal.aborted && r && r.res) {
-          try { r.res.destroy(); } catch {}
-          throw new Error('preempted by player stream');
-        }
-        return r;
-      });
+    // 对齐 v4.1.2：所有回源（播放器实时流 + 后台预取）直接 fetchUpstream，不经全局优先级
+    // 调度器排队/抢占。调度器在单路/少量终端场景会让预取在 6 槽位逻辑中被反复抢占/中止，
+    // 反而把预取饿死（prefetched=0）。同一会话内串行预取 + 在途去重已足够控制带宽突发。
+    // 超时同样对齐 v4.1.2：targetDuration*1000（约 10s），有数据持续到达会自动重置。
+    fetchUpstream(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (XTE-IPTV/4.1; +native-hls)' },
+      timeoutMs: (this.targetDuration * 1000) || 12000,
     }).then(({ res: up, status, headers: h }) => {
       if (status < 200 || status >= 300) {
         up.resume();
@@ -1099,12 +1070,6 @@ class SegmentSession {
       inflight.contentType = h['content-type'] || 'video/mp2t';
       inflight.upstream = up;
       inflight.startedAt = Date.now();
-      const waitMs = inflight.startedAt - queuedAt;
-      if (waitMs > 500) {
-        log('info', '回源排队等待 session=' + this.id,
-          { key: shortKey(key), waitMs, active: DOWNLOAD_SCHED.activeCount(),
-            queued: DOWNLOAD_SCHED.queued(), prefetch: !!prefetch });
-      }
       let backpressureSince = 0;
 
       // 注意：v4.1.3 曾在这里对「持续背压 8s」的客户端强杀上游，实测会误杀正常按 HLS 节奏消费的播放器
