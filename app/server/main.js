@@ -42,7 +42,7 @@ function toAsciiHost(input) {
   return s;
 }
 
-const APP_VERSION = '5.0.1';
+const APP_VERSION = '5.0.2';
 
 // ---------------------------------------------------------------------------
 // 路径与配置
@@ -83,8 +83,13 @@ const DEFAULT_CONFIG = {
                                   //   中断正在播的分片，导致「上版能3路4K、这版只能1路」。单路时仍积极预取。
   refreshMinIntervalMs: 3000,     // m3u8 回源节流：同会话两次刷新至少间隔 3s
   keepAliveIntervalMs: 4000,      // 活跃会话后台保活周期
-  activeWindowMs: 20000,          // 观众活动窗口：20s 内无 m3u8/分片请求即视为已切台，立即停止后台预取/刷新并回收
-  sessionTtlMs: 30000,            // 会话空闲回收 30s（按真实观众活动 lastClientAt 判定，快速清理切走的僵尸会话）
+  // v5.0.2 回退对齐 v4.1.2：观众活动窗口/会话 TTL 必须足够长，覆盖电视/平板/手机播放器
+  // 「先缓冲 30~60s 再播」的行为。v4.1.3~v5.0.1 曾把这两个值缩短到 20s/30s，导致非 PC
+  // 终端（电视盒子、平板、部分手机 IPTV App）一次性拉取多个分片后静默播放时，会话被误判为
+  // 「观众已切走」而回收、缓冲被清空，下次取片冷启动 → 表现为只有 PC（每 4s 轮询 m3u8）
+  // 能看，其他终端转圈/不能看（log29 只有 Windows浏览器 请求，无任何移动/电视终端命中）。
+  activeWindowMs: 45000,          // 观众活动窗口：45s 内无 m3u8/分片请求才视为已切台（v4.1.2 基准值）
+  sessionTtlMs: 90000,            // 会话空闲回收 90s（v4.1.2 基准值，覆盖电视/平板长缓冲）
   stalledRecoverMs: 60000,        // stalled 自动恢复：有连接但超过此时长(ms)无分片送达即断开重连，0=关闭
   segmentTtlMs: 45000,            // 分片缓存有效期 45s
   segRetry: 3,                    // 单分片失败重试次数
@@ -104,6 +109,12 @@ const DEFAULT_CONFIG = {
 let config = loadJson(CONFIG_FILE, DEFAULT_CONFIG);
 config = Object.assign({}, DEFAULT_CONFIG, config);
 normalizeConfigLines(config);
+
+// v5.0.2 关键迁移：activeWindowMs / sessionTtlMs 在 v4.1.3~v5.0.1 曾被缩短到 20s/30s，
+// 会让电视/平板/手机（缓冲 30~60s 后才发下一个请求）的会话被误回收。即使旧配置文件里
+// 持久化了这两个过小的值，也强制抬到 v4.1.2 的安全下限，保证非 PC 终端能看。
+if (!config.activeWindowMs || config.activeWindowMs < 45000) config.activeWindowMs = 45000;
+if (!config.sessionTtlMs || config.sessionTtlMs < 90000) config.sessionTtlMs = 90000;
 
 // 内存日志缓冲
 const logs = [];
