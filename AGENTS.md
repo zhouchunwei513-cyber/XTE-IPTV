@@ -1,8 +1,13 @@
-# XTE-IPTV 直播代理 (FPK) v5.0.2
+# XTE-IPTV 直播代理 (FPK) v5.0.3
 
 ## 项目概览
 飞牛 NAS 上的 IPTV 直播代理服务。输出标准 HLS (m3u8 + TS)，无转码。
-- **v5.0.2（当前）：修复电视/平板/手机等非 PC 终端不能看**
+- **v5.0.3（当前）：修复安装后打开白屏 + x86/ARM 架构分包**
+  - **① 白屏根因**：桌面入口 `app/ui/config` 原为 `"type":"iframe"` + `"protocol":"http"`。当用户通过 **HTTPS / 域名**访问 fnOS 桌面时，浏览器的混合内容（mixed content）策略会拦截内嵌的 `http://NAS:34500` iframe，导致点开图标白屏；通过 HTTP/IP 访问则正常——故表现为"部分用户白屏"。
+  - **修复**：`app/ui/config` 的 `type` 由 `iframe` 改为 `url`，点击图标在新窗口直接打开 `http://NAS:34500/`，彻底规避内嵌混合内容拦截。功能/参数/端口(34500)均不变。
+  - **② 架构分包**：manifest 移除已废弃的 `arch` 字段，仅用 `platform`（`x86` | `arm`）。构建脚本 `/tmp/mkfpk.py` 参数化生成 `xte-5.0.3-x86_64.fpk`(platform=x86) 与 `xte-5.0.3-aarch64.fpk`(platform=arm)。应用为纯 JS、Node 由 fnOS 提供、无原生二进制，两个包的 `app.tgz` 完全相同，仅 manifest 的 platform 不同。
+  - 判定架构：SSH 执行 `uname -m`，`x86_64`→x86 包，`aarch64`→arm 包。
+- **v5.0.2：修复电视/平板/手机等非 PC 终端不能看**
   - **① 非 PC 终端不能看的根因（核心）**：v5.0.1 PC（飞牛桌面端）已不卡，但用户反馈电视盒子、平板、手机不能看。日志（log29）显示太原1会话 `prefetched` 0→24、`hit` 0→21、state 始终 playing，**但全程只有 `terminal":"Windows浏览器"`（192.168.31.1）的请求，没有任何移动/电视终端命中**。对比 v4.1.2（git `35a7457`）发现：v4.1.3 起把「观众活动窗口」`activeWindowMs` 从 **45000ms 缩短到 20000ms**、「会话空闲 TTL」`sessionTtlMs` 从 **90000ms 缩短到 30000ms**。PC 飞牛桌面端每 ~4s 轮询一次 m3u8，从不会超过 20s，所以正常；但电视盒子/平板/手机的 IPTV 播放器会**一次性缓冲多个分片、静默播放 30~60s 后才发下一个请求**，这期间 `reapSessions()` 判定 `idleMs > 20s && active<=0`，把会话误判为「观众已切走」而 `s.destroy()` 回收、清空缓冲；播放器下次取片时只能冷启动/重建，表现为非 PC 终端转圈、不能看。
   - **修复（回退对齐 v4.1.2）**：`activeWindowMs` 恢复 **45000ms**，`sessionTtlMs` 恢复 **90000ms**。启动时对旧持久化配置做迁移（即使 config.json 里存了 20000/30000，也强制抬到 45s/90s 下限），覆盖所有已安装环境。
   - 保留 v5.0 导出功能、v5.0.1 在途下载复用修复（PC 不卡）。
