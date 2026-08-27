@@ -42,7 +42,7 @@ function toAsciiHost(input) {
   return s;
 }
 
-const APP_VERSION = '5.0.2';
+const APP_VERSION = '5.0.3';
 
 // ---------------------------------------------------------------------------
 // 路径与配置
