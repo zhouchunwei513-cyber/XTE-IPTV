@@ -42,7 +42,7 @@ function toAsciiHost(input) {
   return s;
 }
 
-const APP_VERSION = '5.0.3';
+const APP_VERSION = '5.1.0';
 
 // ---------------------------------------------------------------------------
 // 路径与配置
@@ -52,9 +52,9 @@ const WWW_DIR = path.join(__dirname, '..', 'www');
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
 const PORT = parseInt(
-  process.env.DEPLOY_RUN_PORT ||
   process.env.TRIM_SERVICE_PORT ||
   process.env.FPK_SERVICE_PORT ||
+  process.env.DEPLOY_RUN_PORT ||
   process.env.PORT ||
   '34500',
   10
@@ -104,6 +104,14 @@ const DEFAULT_CONFIG = {
   lineIpv6: { enabled: false, host: '', port: PORT },
   lineFrp: { enabled: false, host: '', port: PORT },
   mergeLines: false,              // 是否生成三线路合并列表 /m3u/all.m3u8
+  // v5.1 管理后台用户名/密码认证：
+  //   - 管理界面(www/index.html) 与 /api/* 需登录（会话 token）
+  //   - 播放流 /m3u /play /proxy 保持放行（电视/播放器订阅 M3U 无法输密码），保障所有终端能看
+  //   - 默认不启用（authEnabled=false）；用户在登录/设置里设用户名密码后开启
+  authEnabled: false,
+  authUser: '',
+  authPassHash: '',               // sha256(username:password)，不明文存储密码
+  authPassSalt: 'xte-fpk',
 };
 
 let config = loadJson(CONFIG_FILE, DEFAULT_CONFIG);
@@ -255,6 +263,39 @@ let channels = loadJson(CHANNELS_FILE, []);
 function persistSources() { saveJson(SOURCES_FILE, sources); }
 function persistChannels() { saveJson(CHANNELS_FILE, channels); }
 function persistConfig() { saveJson(CONFIG_FILE, config); }
+
+// ---------------------------------------------------------------------------
+// v5.1 管理后台认证（用户名/密码 + 会话 token）
+// ---------------------------------------------------------------------------
+function hashPass(user, pass) {
+  return crypto.createHash('sha256').update(String(user) + ':' + String(pass) + ':' + (config.authPassSalt || 'xte-fpk')).digest('hex');
+}
+// 内存会话表：token -> 过期时间戳（7 天）
+const AUTH_SESSIONS = new Map();
+const SESSION_TTL_MS = 7 * 24 * 3600 * 1000;
+function createSession() {
+  const token = crypto.randomBytes(24).toString('hex');
+  AUTH_SESSIONS.set(token, Date.now() + SESSION_TTL_MS);
+  return token;
+}
+function validSession(token) {
+  if (!token) return false;
+  const exp = AUTH_SESSIONS.get(token);
+  if (!exp) return false;
+  if (Date.now() > exp) { AUTH_SESSIONS.delete(token); return false; }
+  return true;
+}
+// 从请求提取会话 token（Authorization: Bearer / x-auth-token / ?auth=）
+function getRequestToken(req, parsed) {
+  const auth = req.headers['authorization'] || '';
+  const m = /Bearer\s+(\S+)/i.exec(auth);
+  return (m && m[1]) || req.headers['x-auth-token'] || (parsed && parsed.query && parsed.query.auth) || '';
+}
+function isAuthenticated(req, parsed) {
+  if (!config.authEnabled) return true;          // 未启用认证一律放行
+  if (validSession(getRequestToken(req, parsed))) return true;
+  return false;
+}
 
 // ---------------------------------------------------------------------------
 // 多线路网络工具
@@ -1781,6 +1822,70 @@ async function handleApi(req, res, parsed) {
   const p = parsed.pathname;
   const method = req.method;
 
+  // 登录：校验用户名密码，返回会话 token
+  if (p === '/api/auth/login' && method === 'POST') {
+    const body = JSON.parse(await readBody(req));
+    // 未启用认证时直接放行
+    if (!config.authEnabled) return sendJson(res, 200, { ok: true, token: createSession(), authEnabled: false });
+    const user = String(body.username || '');
+    const pass = String(body.password || '');
+    if (user === config.authUser && hashPass(user, pass) === config.authPassHash) {
+      const token = createSession();
+      log('info', '管理后台登录成功', { user, ip: clientIp(req) });
+      return sendJson(res, 200, { ok: true, token, authEnabled: true, username: user });
+    }
+    log('warn', '管理后台登录失败', { user, ip: clientIp(req) });
+    return sendJson(res, 401, { ok: false, error: '用户名或密码错误' });
+  }
+
+  // 登出
+  if (p === '/api/auth/logout' && method === 'POST') {
+    const t = getRequestToken(req, parsed);
+    if (t) AUTH_SESSIONS.delete(t);
+    return sendJson(res, 200, { ok: true });
+  }
+
+  // 当前认证状态（前端用来决定是否显示登录页）
+  if (p === '/api/auth/status' && method === 'GET') {
+    return sendJson(res, 200, { authEnabled: !!config.authEnabled, authenticated: isAuthenticated(req, parsed) });
+  }
+
+  // 设置/修改用户名密码（需已登录，或未启用认证时用于首次设置）
+  if (p === '/api/auth/setup' && method === 'POST') {
+    if (config.authEnabled && !isAuthenticated(req, parsed)) {
+      return sendJson(res, 401, { ok: false, error: '请先登录' });
+    }
+    const body = JSON.parse(await readBody(req));
+    // 已启用时必须提供旧密码
+    if (config.authEnabled) {
+      if (hashPass(config.authUser, String(body.oldPassword || '')) !== config.authPassHash) {
+        return sendJson(res, 403, { ok: false, error: '当前密码不正确' });
+      }
+    }
+    const user = String(body.username || '').trim();
+    const pass = String(body.password || '');
+    if (!user || !pass) return sendJson(res, 400, { ok: false, error: '用户名和密码不能为空' });
+    if (pass.length < 4) return sendJson(res, 400, { ok: false, error: '密码至少 4 位' });
+    config.authUser = user;
+    config.authPassHash = hashPass(user, pass);
+    config.authEnabled = true;
+    persistConfig();
+    const token = createSession();
+    log('info', '管理认证已设置', { user });
+    return sendJson(res, 200, { ok: true, token, authEnabled: true, username: user });
+  }
+
+  // 关闭认证（需已登录）
+  if (p === '/api/auth/disable' && method === 'POST') {
+    if (!isAuthenticated(req, parsed)) return sendJson(res, 401, { ok: false, error: '请先登录' });
+    config.authEnabled = false;
+    config.authUser = '';
+    config.authPassHash = '';
+    persistConfig();
+    log('info', '管理认证已关闭', {});
+    return sendJson(res, 200, { ok: true });
+  }
+
   // 概览仪表盘
   if (p === '/api/status' && method === 'GET') {
     return sendJson(res, 200, {
@@ -2310,6 +2415,48 @@ const MIME = {
   '.ico': 'image/x-icon',
 };
 
+function serveLoginPage(req, res) {
+  const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>XTE 管理登录</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:"Microsoft YaHei",system-ui,sans-serif;background:linear-gradient(135deg,#0f172a,#1e293b);min-height:100vh;display:flex;align-items:center;justify-content:center;color:#e2e8f0}
+.box{background:#1e293b;border:1px solid #334155;border-radius:16px;padding:36px 32px;width:360px;box-shadow:0 20px 60px rgba(0,0,0,.4)}
+h1{font-size:22px;margin-bottom:6px} .tip{color:#94a3b8;font-size:13px;margin-bottom:24px;line-height:1.6}
+label{display:block;font-size:13px;color:#cbd5e1;margin:14px 0 6px}
+input{width:100%;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:11px 13px;font-size:14px;outline:none}
+input:focus{border-color:#3b82f6}
+button{margin-top:24px;width:100%;background:#3b82f6;border:0;color:#fff;padding:12px;border-radius:8px;font-size:15px;cursor:pointer}
+button:hover{background:#2f6fe0}
+.err{color:#f87171;font-size:13px;margin-top:12px;min-height:18px;text-align:center}
+</style></head><body>
+<div class="box">
+  <h1>XTE 管理后台</h1>
+  <div class="tip">请输入管理用户名和密码登录。<br>播放流（电视/播放器订阅）不受影响。</div>
+  <label>用户名</label><input id="u" autocomplete="username">
+  <label>密码</label><input id="p" type="password" autocomplete="current-password">
+  <button onclick="login()">登 录</button>
+  <div class="err" id="err"></div>
+</div>
+<script>
+async function login(){
+  const u=document.getElementById('u').value.trim();
+  const pw=document.getElementById('p').value;
+  const err=document.getElementById('err'); err.textContent='';
+  try{
+    const r=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:pw})});
+    const j=await r.json();
+    if(j.ok&&j.token){localStorage.setItem('xte_token',j.token);location.href='/';}
+    else err.textContent=j.error||'登录失败';
+  }catch(e){err.textContent='连接失败：'+e;}
+}
+document.getElementById('p').addEventListener('keydown',e=>{if(e.key==='Enter')login();});
+</script></body></html>`;
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
+  return res.end(html);
+}
+
 function serveStatic(req, res, parsed) {
   let rel = parsed.pathname === '/' ? '/index.html' : parsed.pathname;
   // 防目录穿越
@@ -2421,7 +2568,16 @@ const server = http.createServer(async (req, res) => {
       return await serveSegment(req, res, parsed);
     }
     if (p.startsWith('/api/')) {
+      // 管理 API 认证守卫（登录/认证状态接口本身放行）
+      const publicApi = p === '/api/auth/login' || p === '/api/auth/status';
+      if (!publicApi && config.authEnabled && !isAuthenticated(req, parsed)) {
+        return sendJson(res, 401, { error: '未登录或会话已过期', needAuth: true });
+      }
       return await handleApi(req, res, parsed);
+    }
+    // 管理界面静态资源：未登录时返回登录页
+    if (config.authEnabled && !isAuthenticated(req, parsed)) {
+      return serveLoginPage(req, res);
     }
     return serveStatic(req, res, parsed);
   } catch (e) {

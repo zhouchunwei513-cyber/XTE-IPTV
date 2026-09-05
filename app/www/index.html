@@ -258,6 +258,21 @@
         </div>
         <div style="margin-top:16px"><button onclick="saveConfig()">保存设置</button></div>
       </div>
+
+      <div class="panel" style="margin-top:18px">
+        <h2>管理访问认证</h2>
+        <p class="desc">设置用户名/密码后，打开管理后台需先登录；<strong>播放流（电视/播放器订阅的 M3U）不受影响</strong>，保证所有终端能看。</p>
+        <div class="settings-grid">
+          <div class="field"><label>管理用户名</label><input type="text" id="auth_user" placeholder="如 admin"></div>
+          <div class="field"><label id="auth_pw_label">新密码（≥4 位）</label><input type="password" id="auth_pass" placeholder="设置新密码"></div>
+          <div class="field" id="auth_old_wrap" style="display:none"><label>当前密码（修改时填写）</label><input type="password" id="auth_old" placeholder="已启用认证时需验证当前密码"></div>
+        </div>
+        <div style="margin-top:16px;display:flex;gap:10px">
+          <button onclick="saveAuth()">保存认证</button>
+          <button class="ghost" id="auth_disable_btn" style="display:none" onclick="disableAuth()">关闭认证</button>
+        </div>
+        <p class="desc" id="auth_status" style="margin-top:10px"></p>
+      </div>
     </section>
 
     <!-- 日志 -->
@@ -301,6 +316,37 @@
 </div>
 
 <script>
+// ===== v5.1 管理认证：全局 fetch 自动带会话 token，遇 401 回登录页 =====
+(function () {
+  const _fetch = window.fetch.bind(window);
+  window.fetch = function (input, init) {
+    init = init || {};
+    init.headers = init.headers || {};
+    // 支持传入 Headers 对象或普通对象
+    try {
+      if (init.headers instanceof Headers) {
+        const t = localStorage.getItem('xte_token');
+        if (t && !init.headers.has('Authorization')) init.headers.set('Authorization', 'Bearer ' + t);
+      } else {
+        const t = localStorage.getItem('xte_token');
+        if (t && !init.headers['Authorization']) init.headers['Authorization'] = 'Bearer ' + t;
+      }
+    } catch (e) {}
+    return _fetch(input, init).then(function (resp) {
+      if (resp.status === 401) {
+        // 会话过期/未登录：清空 token 并刷新到登录页（服务端返回登录 HTML）
+        try { localStorage.removeItem('xte_token'); } catch (e) {}
+        // 仅当当前不是登录流程时跳转，避免 /api/auth/login 401 也跳转
+        const url = typeof input === 'string' ? input : (input && input.url) || '';
+        if (url.indexOf('/api/auth/login') === -1) {
+          setTimeout(function () { location.reload(); }, 30);
+        }
+      }
+      return resp;
+    });
+  };
+})();
+
 const API = {
   status: () => fetch('/api/status').then(r => r.json()),
   sessions: () => fetch('/api/sessions').then(r => r.json()),
@@ -320,7 +366,7 @@ document.querySelectorAll('.nav a').forEach(a => {
     if (a.dataset.tab === 'dash') loadDash();
     if (a.dataset.tab === 'sources') loadSources();
     if (a.dataset.tab === 'channels') loadChannels();
-    if (a.dataset.tab === 'settings') loadConfig();
+    if (a.dataset.tab === 'settings') { loadConfig(); loadAuthStatus(); }
     if (a.dataset.tab === 'logs') loadLogs();
   };
 });
@@ -813,6 +859,55 @@ async function saveConfig() {
   const r = await fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   if (r.ok) { alert('设置已保存'); loadDash(); }
   else alert('保存失败');
+}
+
+// ===== 管理认证设置 =====
+async function loadAuthStatus() {
+  try {
+    const st = await fetch('/api/auth/status').then(r => r.json());
+    const el = document.getElementById('auth_status');
+    const wrap = document.getElementById('auth_old_wrap');
+    const dbtn = document.getElementById('auth_disable_btn');
+    if (!st) return;
+    if (st.authEnabled) {
+      el.textContent = '当前状态：认证已开启（打开后台需登录）';
+      el.style.color = '#34d399';
+      wrap.style.display = '';
+      dbtn.style.display = '';
+    } else {
+      el.textContent = '当前状态：认证未开启（后台可直接访问）';
+      el.style.color = '#f59e0b';
+      wrap.style.display = 'none';
+      dbtn.style.display = 'none';
+    }
+  } catch (e) {}
+}
+async function saveAuth() {
+  const username = document.getElementById('auth_user').value.trim();
+  const password = document.getElementById('auth_pass').value;
+  const oldPassword = document.getElementById('auth_old').value;
+  if (!username || !password) return alert('请填写用户名和新密码');
+  const r = await fetch('/api/auth/setup', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password, oldPassword }),
+  });
+  const j = await r.json();
+  if (j.ok && j.token) {
+    localStorage.setItem('xte_token', j.token);
+    alert('认证已保存并开启');
+    document.getElementById('auth_pass').value = '';
+    document.getElementById('auth_old').value = '';
+    loadAuthStatus();
+  } else {
+    alert(j.error || '保存失败');
+  }
+}
+async function disableAuth() {
+  if (!confirm('确定关闭管理认证？关闭后后台可直接访问。')) return;
+  const r = await fetch('/api/auth/disable', { method: 'POST' });
+  const j = await r.json();
+  if (j.ok) { alert('认证已关闭'); loadAuthStatus(); }
+  else alert(j.error || '操作失败');
 }
 
 // logs
