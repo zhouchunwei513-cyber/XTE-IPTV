@@ -42,7 +42,7 @@ function toAsciiHost(input) {
   return s;
 }
 
-const APP_VERSION = '5.1.0';
+const APP_VERSION = '5.1.1';
 
 // ---------------------------------------------------------------------------
 // 路径与配置
@@ -2021,7 +2021,9 @@ async function handleApi(req, res, parsed) {
     return sendJson(res, 200, src);
   }
   if (p === '/api/sources/refresh' && method === 'POST') {
-    const body = JSON.parse((await readBody(req)).catch(() => '{}') || '{}');
+    const body = await readBody(req)
+      .then((t) => { try { return JSON.parse(t || '{}'); } catch { return {}; } })
+      .catch(() => ({}));
     if (body.id) {
       const src = sources.find((s) => s.id === body.id);
       if (!src) return sendJson(res, 404, { error: 'source not found' });
