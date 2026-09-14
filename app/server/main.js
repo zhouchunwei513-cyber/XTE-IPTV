@@ -42,7 +42,7 @@ function toAsciiHost(input) {
   return s;
 }
 
-const APP_VERSION = '5.1.1';
+const APP_VERSION = '5.2.0';
 
 // ---------------------------------------------------------------------------
 // 路径与配置
@@ -285,11 +285,28 @@ function validSession(token) {
   if (Date.now() > exp) { AUTH_SESSIONS.delete(token); return false; }
   return true;
 }
-// 从请求提取会话 token（Authorization: Bearer / x-auth-token / ?auth=）
+// 读取请求 Cookie 中的指定值
+function getCookie(req, name) {
+  const cookie = req.headers['cookie'] || '';
+  const m = new RegExp('(?:^|;\\s*)' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '=([^;]*)').exec(cookie);
+  return m ? decodeURIComponent(m[1]) : '';
+}
+// 下发/清除会话 Cookie（HttpOnly；同源 HTTP 访问 NAS，不加 Secure 以免 HTTP 下不下发）
+function setAuthCookie(res, token) {
+  const maxAge = Math.floor(SESSION_TTL_MS / 1000);
+  if (token) {
+    res.setHeader('Set-Cookie',
+      'xte_token=' + encodeURIComponent(token) + '; Path=/; Max-Age=' + maxAge + '; HttpOnly; SameSite=Lax');
+  } else {
+    res.setHeader('Set-Cookie', 'xte_token=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax');
+  }
+}
+// 从请求提取会话 token（Cookie / Authorization: Bearer / x-auth-token / ?auth=）
 function getRequestToken(req, parsed) {
   const auth = req.headers['authorization'] || '';
   const m = /Bearer\s+(\S+)/i.exec(auth);
-  return (m && m[1]) || req.headers['x-auth-token'] || (parsed && parsed.query && parsed.query.auth) || '';
+  return getCookie(req, 'xte_token') || (m && m[1]) || req.headers['x-auth-token'] ||
+    (parsed && parsed.query && parsed.query.auth) || '';
 }
 function isAuthenticated(req, parsed) {
   if (!config.authEnabled) return true;          // 未启用认证一律放行
@@ -1831,6 +1848,7 @@ async function handleApi(req, res, parsed) {
     const pass = String(body.password || '');
     if (user === config.authUser && hashPass(user, pass) === config.authPassHash) {
       const token = createSession();
+      setAuthCookie(res, token);
       log('info', '管理后台登录成功', { user, ip: clientIp(req) });
       return sendJson(res, 200, { ok: true, token, authEnabled: true, username: user });
     }
@@ -1842,6 +1860,7 @@ async function handleApi(req, res, parsed) {
   if (p === '/api/auth/logout' && method === 'POST') {
     const t = getRequestToken(req, parsed);
     if (t) AUTH_SESSIONS.delete(t);
+    setAuthCookie(res, '');
     return sendJson(res, 200, { ok: true });
   }
 
@@ -1871,6 +1890,7 @@ async function handleApi(req, res, parsed) {
     config.authEnabled = true;
     persistConfig();
     const token = createSession();
+    setAuthCookie(res, token);
     log('info', '管理认证已设置', { user });
     return sendJson(res, 200, { ok: true, token, authEnabled: true, username: user });
   }
@@ -1882,6 +1902,7 @@ async function handleApi(req, res, parsed) {
     config.authUser = '';
     config.authPassHash = '';
     persistConfig();
+    setAuthCookie(res, '');
     log('info', '管理认证已关闭', {});
     return sendJson(res, 200, { ok: true });
   }

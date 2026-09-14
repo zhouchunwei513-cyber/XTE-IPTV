@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>XTE-IPTV 直播代理 v5.1.1</title>
+<title>XTE-IPTV 直播代理 v5.2.0</title>
 <style>
   :root{
     --bg:#0e1116; --panel:#161b22; --panel2:#1c232d; --border:#2a323d;
@@ -67,11 +67,13 @@
   .bulk-bar{background:var(--panel);border:1px solid var(--border);border-radius:var(--r);padding:8px 12px;margin-top:-4px}
   .bulk-bar .ch-cb, .bulk-bar input[type=checkbox]{width:auto}
   .export-menu{position:absolute;background:var(--panel);border:1px solid var(--border);
-    border-radius:var(--r);box-shadow:0 8px 24px rgba(0,0,0,.18);padding:6px;z-index:50;min-width:220px}
+    border-radius:var(--r);box-shadow:0 8px 24px rgba(0,0,0,.18);padding:6px;z-index:50;width:248px}
+  .export-menu .export-title{font-size:12px;color:var(--muted);padding:6px 10px 8px;font-weight:600}
   .export-menu button{display:flex;flex-direction:column;align-items:flex-start;width:100%;
     text-align:left;padding:8px 10px;border:none;background:none;cursor:pointer;border-radius:6px;color:var(--text)}
   .export-menu button:hover{background:var(--bg)}
-  .export-menu button small{color:var(--muted);font-size:11px;margin-top:2px}
+  .export-menu button b{font-size:13px}
+  .export-menu button small{color:var(--muted);font-size:11px;margin-top:2px;line-height:1.4}
   .m3u-url{display:flex;gap:8px;align-items:center;background:var(--bg);
     border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:20px}
   .m3u-url code{flex:1;color:var(--accent);font-size:12px;word-break:break-all;cursor:pointer}
@@ -121,7 +123,7 @@
 <body>
 <div class="app">
   <aside class="side">
-    <div class="logo">XTE-IPTV<small>直播代理 v5.1.1</small></div>
+    <div class="logo">XTE-IPTV<small>直播代理 v5.2.0</small></div>
     <nav class="nav">
       <a data-tab="dash" class="active">仪表盘</a>
       <a data-tab="sources">源管理</a>
@@ -129,7 +131,7 @@
       <a data-tab="settings">系统设置</a>
       <a data-tab="logs">运行日志</a>
     </nav>
-    <div class="ver" id="ver">v5.1.1</div>
+    <div class="ver" id="ver">v5.2.0</div>
   </aside>
 
   <main class="main">
@@ -232,9 +234,8 @@
         <button class="ghost sm" onclick="bulkGroup()">批量分组…</button>
         <button class="danger sm" onclick="bulkAction('delete')">批量删除</button>
         <span style="flex:1"></span>
-        <button class="sm" onclick="exportChannels('selected')" title="导出勾选的频道">导出选中</button>
-        <button class="ghost sm" onclick="exportChannels('all')" title="导出当前筛选结果（有搜索词则为搜索结果，否则全部启用频道）">导出</button>
-        <button class="ghost sm" onclick="showExportMenu(event)">▾</button>
+        <button class="sm" onclick="showExportMenu(event,'selected')" title="导出勾选的频道">导出选中 ▾</button>
+        <button class="ghost sm" onclick="showExportMenu(event,'all')" title="导出当前筛选结果（有搜索词则为搜索结果，否则全部启用频道），可选择导出地址方式">导出 ▾</button>
       </div>
       <div class="panel" style="padding:0">
         <table>
@@ -781,8 +782,9 @@ function exportChannels(scope, opts) {
   }
   window.location.href = '/api/channels/export?' + params.toString();
 }
-// 导出选项菜单：线路选择 / 含已禁用 / 原始地址
-function showExportMenu(ev) {
+// 导出选项菜单：默认原始播放地址，另支持内网 / DDNS(IPv6) / FRP 三种代理线路
+// scope: 'selected'（导出勾选）| 'all'（搜索结果或全部启用）
+function showExportMenu(ev, scope) {
   closeExportMenu();
   ev.stopPropagation();
   const menu = document.createElement('div');
@@ -790,22 +792,27 @@ function showExportMenu(ev) {
   menu.id = 'exportMenu';
   const rect = ev.currentTarget.getBoundingClientRect();
   menu.style.top = (rect.bottom + window.scrollY + 4) + 'px';
-  menu.style.left = (rect.right - 220 + window.scrollX) + 'px';
+  menu.style.left = Math.max(8, rect.right - 240) + 'px';
   const q = document.getElementById('chSearch').value || '';
-  const scopeLabel = q.trim() ? '当前搜索结果' : '全部启用频道';
+  const scopeLabel = scope === 'selected'
+    ? '勾选的频道'
+    : (q.trim() ? '当前搜索结果' : '全部启用频道');
+  // 标题 + 四种地址方式；默认（首项）为原始播放地址
   menu.innerHTML = `
-    <button type="button" data-act="inner"><b>导出（内网代理）</b><small>${scopeLabel}，经 XTE 内网地址播放</small></button>
-    <button type="button" data-act="all"><b>导出（三线路合并）</b><small>每条频道含 内网/IPv6/FRP 三个地址</small></button>
-    <button type="button" data-act="raw"><b>导出原始流地址</b><small>备份/迁移用，不经过 XTE 代理</small></button>
-    <button type="button" data-act="raw-disabled" style="border-top:1px solid var(--border);margin-top:4px;padding-top:10px"><b>导出全部（含已禁用）</b><small>原始地址，包含被停用的频道</small></button>`;
+    <div class="export-title">导出${scope === 'selected' ? '选中 · ' : ' · '}${scopeLabel}</div>
+    <button type="button" data-act="raw"><b>原始播放地址（默认）</b><small>频道真实 m3u8，备份/迁移/直接使用，不经过 XTE 代理</small></button>
+    <button type="button" data-act="inner"><b>内网地址</b><small>经 XTE 内网代理地址播放，家中局域网/飞牛影视使用</small></button>
+    <button type="button" data-act="ipv6"><b>DDNS / IPv6 地址</b><small>经 XTE 的 IPv6(DDNS) 线路地址播放，需在系统设置配置 IPv6 线路</small></button>
+    <button type="button" data-act="frp"><b>FRP 地址</b><small>经 XTE 的 FRP 公网线路地址播放，需在系统设置配置 FRP 线路</small></button>`;
   document.body.appendChild(menu);
   menu.addEventListener('click', (e) => {
     const b = e.target.closest('button'); if (!b) return;
     const act = b.dataset.act;
-    if (act === 'inner') exportChannels('all', { line: 'inner' });
-    else if (act === 'all') exportChannels('all', { line: 'all' });
-    else if (act === 'raw') exportChannels('all', { raw: true });
-    else if (act === 'raw-disabled') exportChannels('all', { raw: true, includeDisabled: true });
+    const useScope = scope || 'all';
+    if (act === 'raw') exportChannels(useScope, { raw: true });
+    else if (act === 'inner') exportChannels(useScope, { line: 'inner' });
+    else if (act === 'ipv6') exportChannels(useScope, { line: 'ipv6' });
+    else if (act === 'frp') exportChannels(useScope, { line: 'frp' });
     closeExportMenu();
   });
   setTimeout(() => document.addEventListener('click', closeExportMenuOnce), 0);
