@@ -3,8 +3,9 @@ data/
 *.log
 
 # 构建产物 / 打包
-dist/
-*.fpk
+# 构建中间目录（产物 dist/*.fpk 需要提交，故只忽略 build/）
+build/
+# *.fpk 纳入版本库（供 GitHub 直接下载）
 !app/ui/images/*.png
 
 # 系统/编辑器

@@ -1,8 +1,49 @@
-# XTE-IPTV 直播代理 (FPK) v5.0.3
+# XTE-IPTV 直播代理 (FPK) v5.2.1
 
 ## 项目概览
 飞牛 NAS 上的 IPTV 直播代理服务。输出标准 HLS (m3u8 + TS)，无转码。
-- **v5.0.3（当前）：修复安装后打开白屏 + x86/ARM 架构分包**
+- **v5.2.1（当前）：修复「导入源后电视直播看不了」+ 频道可用性检测**（实测对象：iFansClub 聚合源 852 频道 + 山西移动源 433 频道）
+  - **① 全端不可播的根因——代理地址没有扩展名**：分片地址原为 `/proxy/ts?sid=..&url=..`，路径末尾无 `.ts`，
+    ffmpeg 系 HLS 解析器命中 `allowed_segment_extensions` 白名单直接拒播
+    （`URL ... is not in allowed_segment_extensions`，`ffmpeg -i /play/<id>.m3u8` 必现）。
+    电视盒子/Kodi/mpv/TiviMate 几乎都是 ffmpeg 内核，所以表现是「导入源后全都看不了」。
+    修复：`/proxy/ts/<sid>.ts`、`/proxy/m3u8/<sid>.m3u8`、密钥 `<sid>.key`、初始化段 `<sid>.mp4|.ts`；
+    服务器路由改为前缀匹配（`/proxy/ts` 与 `/proxy/ts/...` 都接受），老播放器缓存的旧地址仍可用。
+    **切勿再把代理 URL 写成无扩展名形式**，否则电视端全灭。
+  - **② 内网地址探测拿到 docker0（`172.17.0.1`）**：旧 `detectLanIp()` 遍历网卡 `unshift` 私网地址后取 `cands[0]`，
+    在有 docker0/br-*/tailscale 的飞牛上返回的是虚拟网桥，`/m3u/inner.m3u8` 里所有频道地址指向 172.17.0.1，
+    局域网电视必然连不上。修复：优先 `/proc/net/route` 默认路由网卡的 IPv4；跳过
+    `docker/br-/veth/virbr/vmnet/tun/tap/tailscale/zt/utun/wg/lo`；结果缓存 60s；支持 `XTE_LAN_IP` 覆盖。
+    `resolvePlaybackBase()` 在「内网线路未显式填 host」时优先用**本次请求的 Host**（新增 `requestBase()` 支持
+    `x-forwarded-host`/`x-forwarded-proto`），只有请求本身是回环才回落探测值。
+    实测启动日志 `线路基地址 inner` 由 `http://172.17.0.1:34500` 变为 `http://192.168.31.101:34500`。
+  - **③ 上游非 HLS 时不再输出垃圾清单**：新增 `isHlsPlaylistText()`，必须含
+    `#EXT-X-TARGETDURATION|STREAM-INF|MEDIA-SEQUENCE|PLAYLIST-TYPE|ENDLIST`（RFC 8216 必备标签）才算 HLS；
+    否则 `servePlaylist` 回 `502` + 可读原因，`SegmentSession.refresh()` 直接抛 `upstream-not-hls` 且不覆盖旧索引。
+    背景：iFansClub 把「频道列表」当播放列表返回（只有 `#EXTM3U`+`#EXTINF`+`x-tvg-url`），旧版会改写成一条
+    `/proxy/ts?url=<错误文案>` 的垃圾清单。
+  - **④ 渐进式媒体直链**：mp4/flv/mkv/mp3 等频道在列表里直接给 `/proxy/ts/<id>.<ext>?url=`（`channelPlayUrl()`），
+    `servePlaylist`/`serveSegment` 遇到这类 URL 直接 `pipeUpstream`（透传 Range，可拖动，不进分片缓存）。
+  - **⑤ 主清单音轨 URI**：`#EXT-X-MEDIA`、`#EXT-X-I-FRAME-STREAM-INF`、`#EXT-X-SESSION-KEY` 的 `URI=` 一并改写
+    （此前漏改 → 播放器去 XTE 找 `/ysp-vip/xxx/audio.m3u8` 404 → 有画面没声音/黑屏）。
+  - **⑥ 数字频道 ID 端点**：`absUrl()` 在「基地址末段是纯数字（≥4 位）+ 相对地址不含 `/`」时按目录方式解析
+    （`/629942219` + `01.m3u8` → `/629942219/01.m3u8`），符合 iFansClub/咪咕中继的实际行为；
+    按 RFC 解析成 `/01.m3u8` 时上游回 `地址格式错误`。
+  - **⑦ `#EXTINF` 解析**：标题改用「引号外最后一个逗号」切分（`lastCommaOutsideQuotes()`，台名含逗号不再截断），
+    支持 `#EXTGRP:` 分组与 UTF-8 BOM；误把多码率主清单当源导入时清空上一频道属性。
+  - **⑧ 频道可用性检测（新功能）**：`POST /api/channels/check`（后台任务，并发 6，body `{all|ids|q, disableBad}`）
+    + `GET /api/channels/check`（进度/结果，含 `badIds`）；判定 = 播放列表必须为真 HLS + 试拉首个分片前 2KB。
+    频道管理页「检测可用性」按钮轮询进度，完成后可一键 `batch action=disable`。实测 117 个 CCTV 频道 14s（100 可用/17 不可用）。
+  - **⑩ 导入体验**：`humanizeSourceError()` 把 `ECONNRESET`/超时/`ENOTFOUND`/403/404/非 M3U 翻译成可执行提示并写入
+    `src.error`（源管理页红色徽标 + 悬浮全文）；`fetchUpstream` 在 `ECONNRESET|ETIMEDOUT|ENETUNREACH|EHOSTUNREACH|
+    EADDRNOTAVAIL|EAI_AGAIN` 时自动以 **IPv4 重试一次**（双栈环境 IPv6 路由常不通）。
+    实测用户现场 `sources.json` 里的 `https://raw.githubusercontent.com/...` 在当前网络被 RST，两条路都不通 →
+    这种情况必须改用「本地上传/文本粘贴」导入。
+  - **⑨ 打包**：改用飞牛官方 `fnpack`（v1.2.4，`fnpack build -d <stage>`，输出 `<appname>.fpk`），
+    脚本 `build-fpk.sh` 生成 `dist/xte-<ver>-x86_64.fpk` 与 `-aarch64.fpk`（app.tgz 内容一致，仅 platform 不同）。
+  - **上游现状（非本软件缺陷，已用上游原始地址交叉验证）**：iFansClub 源里的央视频 VIP / 咪咕体育 / 慢直播摄像头
+    大量已下线或需登录（401/403/「需登录后观看」），抽样 20 个仅 8 个可播；山西移动源抽样 20/20 可播。
+- **v5.0.3：修复安装后打开白屏 + x86/ARM 架构分包**
   - **① 白屏根因**：桌面入口 `app/ui/config` 原为 `"type":"iframe"` + `"protocol":"http"`。当用户通过 **HTTPS / 域名**访问 fnOS 桌面时，浏览器的混合内容（mixed content）策略会拦截内嵌的 `http://NAS:34500` iframe，导致点开图标白屏；通过 HTTP/IP 访问则正常——故表现为"部分用户白屏"。
   - **修复**：`app/ui/config` 的 `type` 由 `iframe` 改为 `url`，点击图标在新窗口直接打开 `http://NAS:34500/`，彻底规避内嵌混合内容拦截。功能/参数/端口(34500)均不变。
   - **② 架构分包**：manifest 移除已废弃的 `arch` 字段，仅用 `platform`（`x86` | `arm`）。构建脚本 `/tmp/mkfpk.py` 参数化生成 `xte-5.0.3-x86_64.fpk`(platform=x86) 与 `xte-5.0.3-aarch64.fpk`(platform=arm)。应用为纯 JS、Node 由 fnOS 提供、无原生二进制，两个包的 `app.tgz` 完全相同，仅 manifest 的 platform 不同。
@@ -37,7 +78,7 @@
 - v4.0.3：修复 direct 模式原样透传 m3u8 导致分片绕过代理的核心问题（分片/子列表/KEY 地址全部改写为走 XTE 代理）。
 
 ## 核心运行原理（务必理解）
-代理链：客户端 → `/m3u/inner.m3u8`（频道列表，每频道 `/play/{id}.m3u8`）→ `/play/{id}.m3u8`（`servePlaylist`：建会话、节流刷新索引、把分片改写为 `/proxy/ts?sid=...&url=...`，子 m3u8 改写为 `/proxy/m3u8?url=...`，EXT-X-KEY/MAP 的 URI 也走 `/proxy/ts`）→ `/proxy/ts`（`serveSegment`：按 sid 找会话；命中缓存立即回；未命中 `streamSegmentToClient` 流式回源边下边缓存；流式建连失败再 `fetchSegmentWithRetry`；彻底失败标记坏片并插 EXT-X-DISCONTINUITY，返回 204 不中断播放）。
+代理链：客户端 → `/m3u/inner.m3u8`（频道列表，每频道 `/play/{id}.m3u8`，渐进式媒体频道直接给 `/proxy/ts/{id}.<ext>?url=...`）→ `/play/{id}.m3u8`（`servePlaylist`：建会话、节流刷新索引，把分片改写为 **`/proxy/ts/<sid>.ts?url=...`**，子 m3u8 改写为 **`/proxy/m3u8/<sid>.m3u8?url=...`**，EXT-X-KEY→`<sid>.key`、EXT-X-MAP→`<sid>.mp4|.ts`、EXT-X-MEDIA/I-FRAME-STREAM-INF/SESSION-KEY 的 URI 同样改写；**路径必须带扩展名**，否则 ffmpeg 系播放器拒播）→ `/proxy/ts/<sid>.ts`（`serveSegment`：按 sid 找会话；命中缓存立即回；未命中 `streamSegmentToClient` 流式回源边下边缓存；流式建连失败再 `fetchSegmentWithRetry`；彻底失败标记坏片并插 EXT-X-DISCONTINUITY，返回 204 不中断播放）。
 - **智能缓冲关键机制（v4.1.1）**：① 非阻塞索引刷新（已有缓存索引立即返回旧索引，后台 refresh）；② 回源节流（同会话两次 m3u8 刷新至少间隔 `refreshMinIntervalMs=3000`，失败指数退避）；③ 序号守护（拒绝 mediaSeq 比当前小的旧清单）；④ 串行预取（`_prefQueue` 单消费者，深度 `prefetchAhead=3`）；⑤ 分片流式回源（首包即写客户端，背压 pause/resume）；⑥ 分片失败重试（segRetry=3 + 刷新索引后再试）。
 - **稳定分片标识**：`segKey(url)` 取 `URL.pathname`，去掉查询串中的动态 token/时间戳/签名，让时效源的同一片能跨请求命中缓存。
 - 相对地址必须用 `absUrl(u, baseUrl)` 解析成绝对地址后再改写，否则 `/proxy/ts?url=相对路径` 无法回源。
@@ -98,8 +139,8 @@ DEPLOY_RUN_PORT=5077 DATA_DIR=/tmp/xte-data node app/server/main.js
 # 语法检查
 node --check app/server/main.js
 
-# 打包 FPK（产物输出到项目根 /workspace/projects/xte-4.1.0.fpk）
-python3 /tmp/mkfpk.py /workspace/projects/xte-4.1.0.fpk
+# 打包 FPK（飞牛官方 fnpack，v5.2.1 起用这个）
+./build-fpk.sh     # → dist/xte-<ver>-x86_64.fpk + dist/xte-<ver>-aarch64.fpk
 ```
 FPK 必须是 gzip 压缩 USTAR tar，magic `1f 8b 08 08`（gzip flag=FNAME），内含 `app.tgz` + `manifest` + `ICON*.PNG` + `cmd/*` + `config/*`。`app.tgz` 内文件必须在包根（server/main.js、www/...），不能多一层 app/ 目录。**下载用的 fpk 必须放在 /workspace/projects/ 根目录**（Python http.server 根是项目根，public/ 子目录会 404）。
 
@@ -140,8 +181,9 @@ FPK 必须是 gzip 压缩 USTAR tar，magic `1f 8b 08 08`（gzip flag=FNAME）�
 |------|------|------|
 | `/m3u`、`/m3u/inner\|ipv6\|frp\|all.m3u8` | GET | 主播放列表（频道 URL 改写为 `/proxy/m3u8?url=...`） |
 | `/play/{id}.m3u8` | GET | 单频道索引（建会话、非阻塞刷新、分片改写为 `/proxy/ts?sid=...`） |
-| `/proxy/m3u8?url=` | GET | 频道索引/嵌套多码率子 m3u8（继续改写） |
-| `/proxy/ts?url=&sid=` | GET | 分片（命中缓存秒回 / 未命中回源+预取，失败 204） |
+| `/proxy/m3u8/<sid>.m3u8?url=`（旧 `/proxy/m3u8?url=` 仍兼容） | GET | 频道索引/嵌套多码率子 m3u8/音轨清单（继续改写） |
+| `/proxy/ts/<sid>.ts?url=`（旧 `/proxy/ts?url=&sid=` 仍兼容） | GET | 分片（命中缓存秒回 / 未命中回源+预取，失败 204）；渐进式媒体直链透传 |
+| `/api/channels/check` | GET/POST | 频道可用性检测：POST 启动（`{all|ids|q}`），GET 查进度（`done/ok/badIds`） |
 | `/api/status` | GET | 仪表盘：version/mode=smart/频道数/会话数/内存/运行时长 |
 | `/api/sessions` | GET | 会话明细与缓冲统计（hit/miss/prefetched/fail） |
 | `/api/config` | GET/POST | 读写配置（仅 refreshIntervalMin 等暴露；缓冲参数内置） |

@@ -42,7 +42,7 @@ function toAsciiHost(input) {
   return s;
 }
 
-const APP_VERSION = '5.2.0';
+const APP_VERSION = '5.2.1';
 
 // ---------------------------------------------------------------------------
 // 路径与配置
@@ -317,19 +317,67 @@ function isAuthenticated(req, parsed) {
 // ---------------------------------------------------------------------------
 // 多线路网络工具
 // ---------------------------------------------------------------------------
+// 探测本机 LAN IP（用于「内网线路」未显式填 host 时生成对外地址）。
+// v5.2.1 关键修复：旧实现取「最后一个私网 IPv4」，在跑着 Docker 的飞牛 NAS 上会拿到
+// docker0 的 172.17.0.1（甚至 br-xxxx 网桥），于是 /m3u/inner.m3u8 里的频道地址全变成
+// 172.17.0.1 —— 同一局域网的电视/盒子/手机根本连不上，表现就是「导入源后电视直播看不了」。
+// 现在改为：① 优先取「默认路由所在网卡」的地址（真正上网/局域网的那块网卡）；
+//          ② 跳过 docker0/br-/veth/tailscale/zt/tun 等虚拟网卡；
+//          ③ 支持环境变量 XTE_LAN_IP 手工指定；④ 结果缓存 60s。
+let lanIpCache = { ip: '', at: 0 };
 function detectLanIp() {
+  const forced = String(process.env.XTE_LAN_IP || '').trim();
+  if (forced) return forced;
+  if (lanIpCache.ip && Date.now() - lanIpCache.at < 60000) return lanIpCache.ip;
+
+  const isVirtual = (name) => /^(docker|br-|veth|virbr|vmnet|tun|tap|tailscale|zt|utun|wg|dummy|lo)/i.test(name);
+  const rank = (ip) => {
+    if (/^192\.168\./.test(ip)) return 0;
+    if (/^10\./.test(ip)) return 1;
+    if (/^172\.(1[6-9]|2\d|3[01])\./.test(ip)) return 2;
+    if (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(ip)) return 6; // CGNAT/Tailscale
+    if (/^169\.254\./.test(ip)) return 8;                              // link-local
+    return 4;                                                          // 公网
+  };
+
   try {
     const ifaces = os.networkInterfaces();
-    const cands = [];
-    for (const name of Object.keys(ifaces)) {
-      for (const ni of ifaces[name] || []) {
-        if (ni.family === 'IPv4' && !ni.internal) {
-          if (/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(ni.address)) cands.unshift(ni.address);
-          else cands.push(ni.address);
+    const pick = (filterFn) => {
+      const cands = [];
+      for (const name of Object.keys(ifaces)) {
+        if (filterFn && !filterFn(name)) continue;
+        const virt = isVirtual(name);
+        for (const ni of ifaces[name] || []) {
+          if (ni.family !== 'IPv4' || ni.internal) continue;
+          // 虚拟网卡只在没有任何候选时兜底，且排到最后
+          cands.push({ ip: ni.address, score: (virt ? 100 : 0) + rank(ni.address) });
         }
       }
+      cands.sort((a, b) => a.score - b.score);
+      return cands.length ? cands[0].ip : '';
+    };
+
+    // ① 默认路由网卡（Linux /proc/net/route：Destination=00000000 且 metric 最小）
+    let defaultIface = '';
+    try {
+      const rows = fs.readFileSync('/proc/net/route', 'utf8').trim().split('\n').slice(1);
+      let best = null;
+      for (const row of rows) {
+        const f = row.split(/\s+/);
+        if (f[1] !== '00000000') continue;
+        const metric = parseInt(f[6], 10) || 0;
+        if (!best || metric < best.metric) best = { iface: f[0], metric };
+      }
+      if (best) defaultIface = best.iface;
+    } catch {}
+    if (defaultIface) {
+      const ip = pick((n) => n === defaultIface);
+      if (ip) { lanIpCache = { ip, at: Date.now() }; return ip; }
     }
-    return cands[0] || '127.0.0.1';
+    // ② 物理网卡里挑私网 IPv4 ③ 实在没有就用任意 IPv4
+    const ip = pick((n) => !isVirtual(n)) || pick();
+    lanIpCache = { ip: ip || '127.0.0.1', at: Date.now() };
+    return lanIpCache.ip;
   } catch { return '127.0.0.1'; }
 }
 
@@ -402,16 +450,40 @@ function buildChannelExtinf(ch) {
   return '#EXTINF:' + meta.join(' ') + ',' + name;
 }
 
-// 单线路播放列表：每频道一个 /play/{id}.m3u8
+// 渐进式媒体（mp4/flv/mkv/…）：不是 HLS，按 m3u8 去请求必然解析失败。
+// v5.2.1：这类频道在播放列表里直接给「代理直链」，播放器能像普通视频一样播。
+const PROGRESSIVE_RE = /\.(mp4|m4v|mkv|mov|flv|avi|webm|mp3|aac|m4a|wav|ogg|mpg|mpeg|ts)(\?|$)/i;
+function isProgressiveMedia(u) {
+  const s = String(u || '');
+  if (!s || /\.m3u8?(\?|$)/i.test(s)) return false;
+  return PROGRESSIVE_RE.test(s);
+}
+function progressiveExt(u) {
+  const m = /\.(mp4|m4v|mkv|mov|flv|avi|webm|mp3|aac|m4a|wav|ogg|mpg|mpeg|ts)(\?|$)/i.exec(String(u || ''));
+  return m ? '.' + m[1].toLowerCase() : '.mp4';
+}
+
+// 频道在播放列表里的条目地址：
+//  - HLS 频道   → /play/{id}.m3u8（索引/分片全部经代理 + 缓冲内核）
+//  - 渐进式媒体 → /proxy/ts/{id}.<ext>?url=...（直接透传，播放器拿到媒体本体）
+// 注：两处路径都以合法扩展名结尾，兼容 ffmpeg 系播放器的扩展名检查。
+function channelPlayUrl(base, ch, line) {
+  if (isProgressiveMedia(ch.url)) {
+    return base + '/proxy/ts/' + encodeURIComponent(ch.id) + progressiveExt(ch.url) +
+      '?url=' + encodeURIComponent(ch.url) + (line ? '&line=' + encodeURIComponent(line) : '');
+  }
+  return base + '/play/' + encodeURIComponent(ch.id) + '.m3u8' +
+    (line ? '?line=' + encodeURIComponent(line) : '');
+}
+
+// 单线路播放列表：每频道一个播放地址（HLS 走 /play，渐进式媒体走 /proxy/ts）
 function buildLinePlaylist(base, list, line) {
   const lines = ['#EXTM3U', '#PLAYLIST:XTE-IPTV'];
   let skipped = 0;
-  // 把线路显式附加到 /play 地址，避免经 fnOS 网关/反代后 Host 丢失导致线路识别回退成「内网」。
-  const lp = line ? '?line=' + encodeURIComponent(line) : '';
   for (const ch of list) {
     if (ch.enabled === false) { skipped++; continue; }
     lines.push(buildChannelExtinf(ch));
-    lines.push(`${base}/play/${encodeURIComponent(ch.id)}.m3u8${lp}`);
+    lines.push(channelPlayUrl(base, ch, line));
   }
   return { text: lines.join('\n') + '\n', skipped };
 }
@@ -431,7 +503,7 @@ function buildMergedPlaylist(bases, list) {
       if (ch.logo) meta.push('tvg-logo="' + ch.logo.replace(/"/g, '') + '"');
       meta.push('tvg-name="' + name.replace(/"/g, '') + ' [' + labels[kind] + ']"');
       lines.push('#EXTINF:' + meta.join(' ') + ',' + name + ' [' + labels[kind] + ']');
-      lines.push(`${base}/play/${encodeURIComponent(ch.id)}.m3u8?line=` + encodeURIComponent(kind));
+      lines.push(channelPlayUrl(base, ch, kind));
     }
   }
   return lines.join('\n') + '\n';
@@ -464,20 +536,36 @@ function getLineBases() {
 // 2) 否则用本次请求的 Host（含 x-forwarded-proto），保证经任意网关/反代回连都可达；
 // 3) 例外：若配置地址指向 127.0.0.1/localhost（FRP 经 fnOS 网关回连时常见），
 //    它对外部播放器不可达，此时也回退到请求 Host，避免「只有直连内网的客户端能播」。
+// 由请求头推导「客户端实际连上的地址」（含反向代理的 x-forwarded-host/proto）
+function requestBase(req) {
+  const h = (req && req.headers) || {};
+  const fwdHost = String(h['x-forwarded-host'] || '').split(',')[0].trim();
+  const host = fwdHost || String(h.host || '').trim() || ('localhost:' + PORT);
+  const proto = String(h['x-forwarded-proto'] || 'http').split(',')[0].trim() || 'http';
+  return proto + '://' + host;
+}
+
+// 地址是否指向「本机回环」（这种地址写进播放列表，别的终端一定连不上）
+function isLoopbackUrl(base) {
+  try {
+    const u = new URL(base);
+    const h = u.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    return h === '127.0.0.1' || h === '::1' || h === 'localhost' || h === '0.0.0.0' || h === '';
+  } catch { return true; }
+}
+
 function resolvePlaybackBase(kind, req) {
+  const k = kind ? String(kind).toLowerCase() : '';
   const bases = getLineBases();
-  const configured = kind ? bases[String(kind).toLowerCase()] : '';
-  const host = (req && req.headers && req.headers.host) || ('localhost:' + PORT);
-  const proto = ((req && req.headers && req.headers['x-forwarded-proto']) || 'http').toString().split(',')[0];
-  const reqBase = proto + '://' + host;
+  const configured = k ? bases[k] : '';
+  const reqBase = requestBase(req);
+  // v5.2.1：「内网线路」未显式填 host 时，优先用「客户端这次实际连上的 Host」。
+  // 播放器能用这个地址连到 XTE，就一定能用同一个地址拉分片（电视盒子/手机/Tailscale 均如此），
+  // 比猜本机 LAN IP 可靠得多；只有请求本身就是回环地址（本机自测/网关改写）才回落探测值。
+  const autoInner = (k === 'inner') && !String((config.lineInner && config.lineInner.host) || '').trim();
+  if (autoInner && !isLoopbackUrl(reqBase)) return reqBase;
   if (configured) {
-    try {
-      const u = new URL(configured);
-      const h = u.hostname.toLowerCase().replace(/^\[|\]$/g, '');
-      if (h === '127.0.0.1' || h === '::1' || h === 'localhost') {
-        return reqBase; // 配置的是回环地址，外部不可达，用请求 Host
-      }
-    } catch (_) {}
+    if (isLoopbackUrl(configured)) return reqBase; // 配置的是回环地址，外部不可达，改用请求 Host
     return configured;
   }
   return reqBase;
@@ -531,7 +619,7 @@ function fetchUpstream(targetUrl, { headers, timeoutMs, method } = {}) {
     delete reqHeaders.host;
     delete reqHeaders.Host;
 
-    const doReq = (urlStr, redirsLeft) => {
+    const doReq = (urlStr, redirsLeft, forceFamily) => {
       let u;
       try { u = new URL(urlStr); } catch (e) { return reject(e); }
       // IPv6 字面地址：URL.hostname 已去方括号，显式 family:6 避免 getaddrinfo 把它当域名
@@ -563,6 +651,7 @@ function fetchUpstream(targetUrl, { headers, timeoutMs, method } = {}) {
         },
       };
       if (isV6) reqOpts.family = 6;
+      else if (forceFamily) reqOpts.family = forceFamily;
       const tConn = Date.now();
       const req = lib.request(reqOpts, (res) => {
         const connectMs = Date.now() - tConn; // 建连+首字节到达的总等待（TTFB 近似）
@@ -571,7 +660,7 @@ function fetchUpstream(targetUrl, { headers, timeoutMs, method } = {}) {
           res.resume();
           const next = new URL(res.headers.location, urlStr).toString();
           netLog('info', '回源重定向', { from: hostLabel(u), to: hostLabel(next), status, connectMs });
-          return doReq(next, redirsLeft - 1);
+          return doReq(next, redirsLeft - 1, forceFamily);
         }
         if (redirsLeft === REDIRECT_LIMIT) {
           netLog('info', '回源响应', { host: hostLabel(u), status, connectMs,
@@ -584,7 +673,17 @@ function fetchUpstream(targetUrl, { headers, timeoutMs, method } = {}) {
         req.destroy(new Error('upstream timeout'));
       });
       req.on('error', (e) => {
-        netLog('warn', '回源连接错误', { host: hostLabel(u), type: e.code || classifyError(e), error: e.message }, true);
+        // v5.2.1：双栈环境里 IPv6 路由常常是坏的（DNS 先返回 AAAA，连接被 RST/超时），
+        // 这类「连不上」的源站用 IPv4 往往能通（国内访问 GitHub raw 等典型）。这里自动回退一次。
+        const code = String(e.code || '');
+        const canRetryV4 = !isV6 && !forceFamily &&
+          /^(ECONNRESET|ETIMEDOUT|ENETUNREACH|EHOSTUNREACH|EADDRNOTAVAIL|EAI_AGAIN)$/.test(code);
+        if (canRetryV4) {
+          netLog('warn', '回源连接错误，改用 IPv4 重试', { host: hostLabel(u), type: code, error: e.message }, true);
+          try { req.destroy(); } catch {}
+          return doReq(urlStr, redirsLeft, 4);
+        }
+        netLog('warn', '回源连接错误', { host: hostLabel(u), type: code || classifyError(e), error: e.message }, true);
         reject(e);
       });
       req.end();
@@ -624,8 +723,8 @@ function pipeUpstream(targetUrl, req, res, extraLog, onBytes) {
 }
 
 // 整页拉取（用于 m3u8 解析）；自动处理 gzip/deflate/br 压缩
-function fetchText(url, headers) {
-  return fetchUpstream(url, { headers, timeoutMs: 10000 }).then(({ res, status }) => {
+function fetchText(url, headers, timeoutMs) {
+  return fetchUpstream(url, { headers, timeoutMs: timeoutMs || 10000 }).then(({ res, status }) => {
     return new Promise((resolve, reject) => {
       const chunks = [];
       let stream = res;
@@ -647,6 +746,25 @@ function fetchText(url, headers) {
   });
 }
 
+// 把回源错误翻译成用户能据此行动的提示（源管理页直接展示）
+function humanizeSourceError(e, srcUrl) {
+  const m = String((e && e.message) || e || '');
+  const code = String((e && e.code) || '');
+  const host = (() => { try { return new URL(srcUrl).host; } catch { return ''; } })();
+  const where = host ? `（${host}）` : '';
+  if (/ECONNRESET|socket hang up/i.test(m) || /ECONNRESET/.test(code)) {
+    return `源站连接被重置${where}：地址在当前网络已无法访问（raw.githubusercontent.com 等常被阻断）。` +
+      '请改用「本地上传」或「文本粘贴」导入 M3U，或给 NAS 配置代理后重试';
+  }
+  if (/ETIMEDOUT|timeout/i.test(m)) return `源站响应超时${where}：网络不通或源站太慢，稍后重试或换地址`;
+  if (/ENOTFOUND|EAI_AGAIN/i.test(m)) return `域名解析失败${where}：检查地址拼写 / NAS 的 DNS 与网络`;
+  if (/ECONNREFUSED/i.test(m)) return `源站拒绝连接${where}：端口未开或被防火墙拦截`;
+  if (/status 40[13]/.test(m)) return `源站拒绝访问${where}：可能需要登录/鉴权，或该地址已失效`;
+  if (/status 404/.test(m)) return `地址不存在（404）${where}：订阅地址可能已变更或删除`;
+  if (/not-hls|非 HLS/i.test(m)) return `源站返回的不是 M3U 播放列表${where}：请确认导入的是频道列表文件`;
+  return m || '未知错误';
+}
+
 function classifyError(e) {
   const m = (e && e.message) ? e.message : String(e);
   if (/timeout/i.test(m)) return 'timeout';
@@ -662,21 +780,44 @@ function classifyError(e) {
 // M3U 解析
 // ---------------------------------------------------------------------------
 function parseM3U(text) {
-  const lines = text.split(/\r?\n/);
+  const lines = String(text || '').replace(/^\uFEFF/, '').split(/\r?\n/);
   const segs = [];
   let attrs = {};
+  let pendingGroup = '';
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
+    if (!line) continue;
     if (line.startsWith('#EXTINF')) {
       attrs = parseExtinf(line);
+      pendingGroup = '';
+    } else if (line.startsWith('#EXTGRP:')) {
+      // 部分直播源用独立的 #EXTGRP:分组名 指定分组（不带 group-title 属性）
+      pendingGroup = line.slice(8).trim();
     } else if (line.startsWith('#EXT-X-STREAM-INF')) {
-      attrs = parseExtinf(line);
-    } else if (line && !line.startsWith('#')) {
+      // 误把多码率主清单当直播源导入时：清空上一个频道的属性，避免台名串味
+      attrs = {};
+    } else if (!line.startsWith('#')) {
+      if (pendingGroup && !attrs.group) attrs.group = pendingGroup;
       segs.push({ url: line, attrs });
       attrs = {};
+      pendingGroup = '';
     }
   }
   return segs;
+}
+
+// 找出「引号外」的最后一个逗号：EXTINF 的标题从它之后开始。
+// 旧实现用 lastIndexOf(',')，标题里带逗号（如 “CCTV1,高清”）或属性值里带逗号时会切错。
+function lastCommaOutsideQuotes(s) {
+  let quote = '';
+  let idx = -1;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (quote) { if (c === quote) quote = ''; }
+    else if (c === '"' || c === "'") quote = c;
+    else if (c === ',') idx = i;
+  }
+  return idx;
 }
 
 function parseExtinf(line) {
@@ -685,7 +826,7 @@ function parseExtinf(line) {
   const re = /([a-zA-Z0-9_-]+)=(?:"([^"]*)"|'([^']*)'|([^\s,]+))/g;
   let m;
   while ((m = re.exec(line))) out[camel(m[1])] = (m[2] !== undefined ? m[2] : (m[3] !== undefined ? m[3] : m[4])) || '';
-  const comma = line.lastIndexOf(',');
+  const comma = lastCommaOutsideQuotes(line);
   if (comma >= 0) out.title = line.slice(comma + 1).trim();
   return out;
 }
@@ -712,6 +853,20 @@ function buildM3U(chList) {
   return lines.join('\n') + '\n';
 }
 
+// 上游内容是否真的是 HLS 播放列表。
+// v5.2.1：很多源站在“频道下线/需要登录/防盗链”时返回的是纯文本或 HTML 错误页，
+// 旧实现把它当成 m3u8 继续改写成一条 /proxy/ts?url=<错误文案>，播放器拿到的是**垃圾清单**
+// （既没有 #EXTM3U 也没有 #EXTINF），表现为「点开就报错/一直转圈」。
+function isHlsPlaylistText(text) {
+  const t = String(text || '');
+  if (!t.trim()) return false;
+  if (!/^\s*#EXTM3U/im.test(t) && !/#EXTINF/i.test(t)) return false;
+  // 真正的 HLS 清单必带 RFC 8216 的必备标签：媒体清单 #EXT-X-TARGETDURATION，
+  // 多码率主清单 #EXT-X-STREAM-INF。像 iFansClub 把「频道列表」当播放列表返回的情况
+  // （只有 #EXTM3U + #EXTINF + x-tvg-url），必须判为非 HLS，否则播放器解析出的是频道表。
+  return /#EXT-X-(TARGETDURATION|STREAM-INF|MEDIA-SEQUENCE|PLAYLIST-TYPE|ENDLIST)/i.test(t);
+}
+
 // 解析分片 m3u8（含序号、是否直播）
 function parseMediaPlaylist(text, baseUrl) {
   const lines = text.split(/\r?\n/);
@@ -735,7 +890,24 @@ function parseMediaPlaylist(text, baseUrl) {
 }
 
 function absUrl(u, base) {
-  try { return new URL(u, base).toString(); } catch { return u; }
+  try {
+    let b = base;
+    // 国内部分直播源（如按「纯数字频道 ID」提供聚合地址的 iFansClub/咪咕中继）把相对地址
+    // 当成「频道目录」下的文件：/629942219/01.m3u8。而 RFC 会解析成根路径 /01.m3u8，
+    // 实测上游直接返回「地址格式错误」→ 该频道必然看不了。
+    // 规则：基地址末段是纯数字频道 ID，且相对地址不含 '/' 时，按目录方式解析。
+    if (b && u && !/^[a-z][a-z0-9+.-]*:/i.test(u) && u.indexOf('/') < 0) {
+      try {
+        const bu = new URL(b);
+        const last = bu.pathname.split('/').filter(Boolean).pop() || '';
+        if (/^\d{4,}$/.test(last)) {
+          if (!bu.pathname.endsWith('/')) bu.pathname += '/';
+          b = bu.toString();
+        }
+      } catch (_) {}
+    }
+    return new URL(u, b).toString();
+  } catch { return u; }
 }
 
 // 统一改写：把 m3u8 内的分片 / 子列表 / 加密 KEY / MAP 初始化段全部改写为走 XTE 代理。
@@ -751,21 +923,41 @@ function rewriteMediaPlaylist(raw, proxyBase, sid, badKeys, baseUrl, line) {
   // 把线路标识透传到分片/子清单 URL，保证播放器后续 /proxy/ts 请求仍能识别真实线路
   // （否则 /proxy/ts 不带线路信息，detectLine 会退回按 Host/IP 猜测，FRP/IPv6 被误判成内网）
   const lineParam = line ? '&line=' + encodeURIComponent(line.toLowerCase()) : '';
-  const rewriteUri = (u) => {
+  // v5.2.1 关键修复：代理地址必须带「能被播放器识别的扩展名」。
+  // 旧写法 /proxy/ts?url=... 的 path 末尾没有 .ts，ffmpeg 系播放器（Kodi/mpv/TiviMate/多数
+  // 电视盒子内置解码器）会在 hls.c 的 allowed_segment_extensions 检查里直接拒播：
+  //   "URL ... is not in allowed_segment_extensions" → 表现为「导入源后电视直播看不了」。
+  // 因此统一改成 /proxy/ts/<sid>.ts?url=... 与 /proxy/m3u8/<sid>.m3u8?url=...，
+  // 路径带扩展名，真实地址仍放在 query 里（路由侧同时兼容旧格式）。
+  const rewriteUri = (u, forcedExt) => {
     const abs = baseUrl ? absUrl(u, baseUrl) : u;
-    const isNested = /\.m3u8(\?|$)/i.test(abs);
-    const ep = isNested ? '/proxy/m3u8' : '/proxy/ts';
-    // 子 m3u8 不需要 sid（它是独立频道的另一条流）；分片/KEY/MAP 带 sid 命中会话
+    const isNested = /\.m3u8?(\?|$)/i.test(abs);
     const suffix = (isNested ? '' : sidParam) + lineParam;
-    return proxyBase + ep + '?url=' + encodeURIComponent(abs) + suffix;
+    if (isNested) {
+      return proxyBase + '/proxy/m3u8/' + encodeURIComponent(sid) + '.m3u8?url=' +
+        encodeURIComponent(abs) + suffix;
+    }
+    const ext = forcedExt || '.ts';
+    return proxyBase + '/proxy/ts/' + encodeURIComponent(sid) + ext + '?url=' +
+      encodeURIComponent(abs) + suffix;
   };
   for (let i = 0; i < lines.length; i++) {
     let line = lines[i];
     const trimmed = line.trim();
     if (!trimmed) { out.push(line); continue; }
     if (trimmed.startsWith('#')) {
-      if (trimmed.startsWith('#EXT-X-KEY:') || trimmed.startsWith('#EXT-X-MAP:')) {
-        line = line.replace(/URI="([^"]+)"/i, (m, u) => 'URI="' + rewriteUri(u) + '"');
+      if (trimmed.startsWith('#EXT-X-KEY:')) {
+        // 密钥 URI：用 .key 结尾，避免部分播放器按扩展名过滤（内容仍是原始密钥字节）
+        line = line.replace(/URI="([^"]+)"/i, (m, u) => 'URI="' + rewriteUri(u, '.key') + '"');
+      } else if (trimmed.startsWith('#EXT-X-MAP:')) {
+        // 初始化段：fMP4 用 .mp4，TS 用 .ts（都在播放器允许的扩展名列表内）
+        const mapExt = /\.ts(\?|$)/i.test(trimmed) ? '.ts' : '.mp4';
+        line = line.replace(/URI="([^"]+)"/i, (m, u) => 'URI="' + rewriteUri(u, mapExt) + '"');
+      } else if (/^#EXT-X-(MEDIA|I-FRAME-STREAM-INF|SESSION-KEY|PRELOAD-HINT):/i.test(trimmed) && /URI="/i.test(trimmed)) {
+        // v5.2.1：多码率主清单里的音轨/字幕轨（#EXT-X-MEDIA URI）以前没改写，
+        // 结果是播放器去 XTE 上找 /ysp-vip/xxx/audio.m3u8 → 404，表现为「有画面没声音」
+        // 或直接黑屏。这类 URI 本身也是 m3u8（或分片），统一交给 rewriteUri 判断。
+        line = line.replace(/URI="([^"]+)"/g, (m, u) => 'URI="' + rewriteUri(u) + '"');
       }
       out.push(line);
       continue;
@@ -778,13 +970,8 @@ function rewriteMediaPlaylist(raw, proxyBase, sid, badKeys, baseUrl, line) {
       continue;
     }
     pendingDisc = false;
-    const isNested = /\.m3u8(\?|$)/i.test(abs);
-    if (isNested) {
-      out.push(proxyBase + '/proxy/m3u8?url=' + encodeURIComponent(abs) + lineParam);
-    } else {
-      out.push(proxyBase + '/proxy/ts?sid=' + encodeURIComponent(sid) +
-        '&url=' + encodeURIComponent(abs) + lineParam);
-    }
+    // 分片地址统一带扩展名（见 rewriteUri 注释）：.m3u8 走子清单，其余按分片走 .ts
+    out.push(rewriteUri(abs));
   }
   return out.join('\n');
 }
@@ -926,6 +1113,11 @@ class SegmentSession {
           'User-Agent': 'Mozilla/5.0 (XTE-IPTV/4.1; +native-hls)',
         });
         const text = buf.toString('utf8');
+        // v5.2.1：上游不是 HLS（错误页/纯文本/JSON）时直接判失败，保住上一份可用索引，
+        // 绝不把垃圾内容写进 playlistRaw。
+        if (!isHlsPlaylistText(text)) {
+          throw new Error('upstream-not-hls: ' + text.replace(/\s+/g, ' ').trim().slice(0, 120));
+        }
         const pl = parseMediaPlaylist(text, this.channelUrl);
         // 序号守护：只接受不落后于当前的清单
         if (this.playlistRaw && pl.mediaSeq > 0 && this.mediaSeq > 0 && pl.mediaSeq < this.mediaSeq) {
@@ -1765,10 +1957,10 @@ async function refreshSource(src) {
       { count: newChannels.length, costMs: Date.now() - startedAt });
     return { count: newChannels.length };
   } catch (e) {
-    src.error = e.message;
+    src.error = humanizeSourceError(e, src.url);
     src.lastRefreshAt = Date.now();
     persistSources();
-    log('error', '源刷新失败 ' + src.name, { type: classifyError(e), error: e.message });
+    log('error', '源刷新失败 ' + src.name, { type: classifyError(e), error: e.message, hint: src.error });
     throw e;
   }
 }
@@ -1833,6 +2025,104 @@ function urlParse(reqUrl) {
   const query = {};
   for (const [k, v] of u.searchParams) query[k] = v;
   return { pathname: u.pathname, query };
+}
+
+// ---------------------------------------------------------------------------
+// v5.2.1 频道可用性检测（后台任务 + 进度轮询）
+//   背景：一份几百上千条的直播源里，常见「上游已下线 / 需登录 / 防盗链」的死频道。
+//   电视上点到死频道就是转圈，因此提供一次性探测，把不可用的批量停用。
+//   判定：先取播放列表（必须是真 HLS 或渐进式媒体），再试拉第一个分片前 2KB。
+// ---------------------------------------------------------------------------
+const CHANNEL_CHECK = {
+  running: false, total: 0, done: 0, ok: 0, bad: [], startedAt: 0, finishedAt: 0,
+  disableBad: false, concurrency: 6, aborted: false,
+};
+
+function channelCheckStatus() {
+  return {
+    running: CHANNEL_CHECK.running,
+    total: CHANNEL_CHECK.total,
+    done: CHANNEL_CHECK.done,
+    ok: CHANNEL_CHECK.ok,
+    badCount: CHANNEL_CHECK.bad.length,
+    badIds: CHANNEL_CHECK.bad.map((b) => b.id),
+    badSample: CHANNEL_CHECK.bad.slice(0, 20),
+    startedAt: CHANNEL_CHECK.startedAt,
+    finishedAt: CHANNEL_CHECK.finishedAt,
+    disableBad: CHANNEL_CHECK.disableBad,
+  };
+}
+
+async function probeChannel(ch) {
+  const UA = { 'User-Agent': 'Mozilla/5.0 (XTE-IPTV/5.2.1; +health-check)' };
+  try {
+    if (isProgressiveMedia(ch.url)) {
+      const r = await fetchUpstream(ch.url, { headers: Object.assign({ Range: 'bytes=0-1023' }, UA), timeoutMs: 8000 });
+      const ok = r.status < 400;
+      try { r.res.destroy(); } catch {}
+      return ok;
+    }
+    const buf = await fetchText(ch.url, UA, 8000);
+    const text = buf.toString('utf8');
+    if (!isHlsPlaylistText(text)) return false;
+    const pl = parseMediaPlaylist(text, ch.url);
+    const seg = pl.segs[0];
+    if (!seg) return true; // 空索引（刚起播）也算可用，交给播放时兜底
+    const r2 = await fetchUpstream(seg, { headers: Object.assign({ Range: 'bytes=0-2047' }, UA), timeoutMs: 8000 });
+    const ok = r2.status < 400;
+    try { r2.res.destroy(); } catch {}
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+function startChannelCheck(targets, disableBad) {
+  CHANNEL_CHECK.running = true;
+  CHANNEL_CHECK.total = targets.length;
+  CHANNEL_CHECK.done = 0;
+  CHANNEL_CHECK.ok = 0;
+  CHANNEL_CHECK.bad = [];
+  CHANNEL_CHECK.startedAt = Date.now();
+  CHANNEL_CHECK.finishedAt = 0;
+  CHANNEL_CHECK.disableBad = !!disableBad;
+  CHANNEL_CHECK.aborted = false;
+  const queue = targets.slice();
+  log('info', '开始频道可用性检测', { total: queue.length, disableBad: !!disableBad });
+
+  const worker = async () => {
+    while (queue.length && !CHANNEL_CHECK.aborted) {
+      const ch = queue.shift();
+      let good = false;
+      try { good = await probeChannel(ch); } catch { good = false; }
+      if (CHANNEL_CHECK.aborted) break;
+      CHANNEL_CHECK.done++;
+      if (good) CHANNEL_CHECK.ok++;
+      else CHANNEL_CHECK.bad.push({ id: ch.id, name: ch.name || ch.url });
+    }
+  };
+  const n = Math.max(1, Math.min(CHANNEL_CHECK.concurrency, queue.length));
+  Promise.all(Array.from({ length: n }, () => worker())).then(() => {
+    CHANNEL_CHECK.running = false;
+    CHANNEL_CHECK.finishedAt = Date.now();
+    let disabled = 0;
+    if (CHANNEL_CHECK.disableBad && CHANNEL_CHECK.bad.length) {
+      const badIds = new Set(CHANNEL_CHECK.bad.map((b) => b.id));
+      for (const c of channels) {
+        if (badIds.has(c.id) && c.enabled !== false) { c.enabled = false; disabled++; }
+      }
+      if (disabled) persistChannels();
+    }
+    log('info', '频道可用性检测完成', {
+      total: CHANNEL_CHECK.total, ok: CHANNEL_CHECK.ok, bad: CHANNEL_CHECK.bad.length,
+      disabled, costMs: CHANNEL_CHECK.finishedAt - CHANNEL_CHECK.startedAt,
+    });
+  }).catch((e) => {
+    CHANNEL_CHECK.running = false;
+    CHANNEL_CHECK.finishedAt = Date.now();
+    log('error', '频道可用性检测异常', { error: e.message });
+  });
+  return queue.length;
 }
 
 async function handleApi(req, res, parsed) {
@@ -2092,6 +2382,28 @@ async function handleApi(req, res, parsed) {
     const start = (page - 1) * size;
     return sendJson(res, 200, { total, page, size, items: list.slice(start, start + size) });
   }
+  // 频道可用性检测：POST 启动（all/ids/q + disableBad），GET 查进度
+  if (p === '/api/channels/check' && method === 'GET') {
+    return sendJson(res, 200, channelCheckStatus());
+  }
+  if (p === '/api/channels/check' && method === 'POST') {
+    if (CHANNEL_CHECK.running) return sendJson(res, 409, { error: '检测正在进行中', status: channelCheckStatus() });
+    const body = JSON.parse(await readBody(req));
+    let targets = channels.filter((c) => c.enabled !== false);
+    if (!body.all) {
+      const idSet = new Set(Array.isArray(body.ids) ? body.ids : []);
+      if (idSet.size) targets = targets.filter((c) => idSet.has(c.id));
+    }
+    if (body.q) {
+      const q = String(body.q).toLowerCase();
+      targets = targets.filter((c) => (c.name || '').toLowerCase().includes(q) || (c.group || '').toLowerCase().includes(q));
+    }
+    if (!targets.length) return sendJson(res, 400, { error: '没有可检测的启用频道' });
+    if (targets.length > 4000) targets = targets.slice(0, 4000);
+    startChannelCheck(targets, body.disableBad === true);
+    return sendJson(res, 200, { started: true, total: targets.length, status: channelCheckStatus() });
+  }
+
   // 批量操作：{ ids?: string[], all?: boolean, q?: string, action: 'enable'|'disable'|'delete'|'group', group?: string }
   if (p === '/api/channels/batch' && method === 'POST') {
     const body = JSON.parse(await readBody(req));
@@ -2167,11 +2479,11 @@ async function handleApi(req, res, parsed) {
           if (ch.logo) meta.push('tvg-logo="' + ch.logo.replace(/"/g, '') + '"');
           meta.push('tvg-name="' + name.replace(/"/g, '') + ' [' + labels[kind] + ']"');
           lines.push('#EXTINF:' + meta.join(' ') + ',' + name + ' [' + labels[kind] + ']');
-          lines.push(`${b}/play/${encodeURIComponent(ch.id)}.m3u8?line=` + encodeURIComponent(kind));
+          lines.push(channelPlayUrl(b, ch, kind));
         }
       } else {
         lines.push(buildChannelExtinf(ch));
-        lines.push(`${base}/play/${encodeURIComponent(ch.id)}.m3u8?line=` + encodeURIComponent(line));
+        lines.push(channelPlayUrl(base, ch, line));
       }
     }
     const m3u = lines.join('\n') + '\n';
@@ -2237,7 +2549,8 @@ function serveMainPlaylist(req, res, parsed) {
     if (c.logo) attr.push(`tvg-logo="${c.logo}"`);
     if (c.group) attr.push(`group-title="${c.group}"`);
     out.push(`#EXTINF:-1 ${attr.join(' ')},${name}`);
-    out.push(base + '/proxy/m3u8?url=' + encodeURIComponent(c.url));
+    // v5.2.1：优先 /play/{id}.m3u8（走会话缓冲内核），渐进式媒体直接给代理直链
+    out.push(channelPlayUrl(base, c, ''));
   }
   res.writeHead(200, {
     'Content-Type': 'application/vnd.apple.mpegurl; charset=utf-8',
@@ -2253,6 +2566,13 @@ async function servePlaylist(req, res, parsed, lineHint) {
   const targetUrl = q.url;
   if (!targetUrl) return sendJson(res, 400, { error: 'missing url' });
   const chan = channels.find((c) => c.url === targetUrl) || null;
+
+  // v5.2.1：渐进式媒体（mp4/flv/mkv…）不是 HLS，不能当索引解析，直接把媒体本体透传
+  // （保留客户端的 Range 头，播放器可拖动进度）。
+  if (isProgressiveMedia(targetUrl)) {
+    log('info', '渐进式媒体频道直接透传', { channel: (chan && chan.name) || '', url: shortKey(targetUrl) });
+    return pipeUpstream(targetUrl, req, res, 'progressive');
+  }
 
   // v4.1 统一智能缓冲：所有播放都经会话预取/容错，m3u8 分片地址改写为带 sid 的代理地址，
   // 既保证外网/跨网客户端可达，又靠后台预取维持长时间流畅。
@@ -2271,6 +2591,21 @@ async function servePlaylist(req, res, parsed, lineHint) {
     } else {
       pl = await session.refresh();
       session.warmPrefetch(0); // 首载即预热前 N 片
+    }
+    // 上游内容校验：源站返回错误页/纯文本时，绝不能改写成垃圾 m3u8 丢给播放器
+    if (!isHlsPlaylistText(session.playlistRaw)) {
+      const brief = String(session.playlistRaw || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+      log('warn', '上游未返回 HLS 播放列表，已拒绝输出垃圾清单 session=' + session.id,
+        { channel: (chan && chan.name) || '', url: shortKey(targetUrl), brief });
+      if (!res.headersSent) {
+        res.writeHead(502, {
+          'Content-Type': 'text/plain; charset=utf-8',
+          'Access-Control-Allow-Origin': '*',
+          'Cache-Control': 'no-cache',
+        });
+        res.end('# XTE: 源站未返回 HLS 播放列表（频道可能已下线/需要登录/防盗链）\n# ' + brief + '\n');
+      }
+      return;
     }
     // 分片/子清单基地址：对齐 v4.1.2 行为——播放器用哪个 Host 连上 XTE，
     // 分片就指回哪个 Host。显式配置的线路地址优先；未配置或配置指向回环
@@ -2297,7 +2632,19 @@ async function servePlaylist(req, res, parsed, lineHint) {
   } catch (e) {
     log('error', 'm3u8 处理失败，流式兜底 session=' + session.id,
       { channel: (chan && chan.name) || '', type: classifyError(e), error: e.message });
-    if (!res.headersSent) pipeUpstream(targetUrl, req, res, 'm3u8-fallback');
+    if (!res.headersSent) {
+      if (/^upstream-not-hls/.test(String(e && e.message || ''))) {
+        // 上游给的不是播放列表：回 502 + 一行可读原因，播放器会显示「无法播放」而不是乱解析
+        res.writeHead(502, {
+          'Content-Type': 'text/plain; charset=utf-8',
+          'Access-Control-Allow-Origin': '*',
+          'Cache-Control': 'no-cache',
+        });
+        res.end('# XTE: 源站未返回 HLS 播放列表\n# ' + String(e.message).slice(0, 200) + '\n');
+      } else {
+        pipeUpstream(targetUrl, req, res, 'm3u8-fallback');
+      }
+    }
   }
 }
 
@@ -2582,11 +2929,11 @@ const server = http.createServer(async (req, res) => {
       return await servePlaylist(req, res, parsed, req._xteLine);
     }
 
-    if (p === '/proxy/m3u8') {
+    if (p === '/proxy/m3u8' || p.startsWith('/proxy/m3u8/')) {
       req._xteLine = detectLine(req);
       return await servePlaylist(req, res, parsed, req._xteLine);
     }
-    if (p === '/proxy/ts') {
+    if (p === '/proxy/ts' || p.startsWith('/proxy/ts/')) {
       req._xteLine = detectLine(req);
       return await serveSegment(req, res, parsed);
     }

@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>XTE-IPTV 直播代理 v5.2.0</title>
+<title>XTE-IPTV 直播代理 v5.2.1</title>
 <style>
   :root{
     --bg:#0e1116; --panel:#161b22; --panel2:#1c232d; --border:#2a323d;
@@ -123,7 +123,7 @@
 <body>
 <div class="app">
   <aside class="side">
-    <div class="logo">XTE-IPTV<small>直播代理 v5.2.0</small></div>
+    <div class="logo">XTE-IPTV<small>直播代理 v5.2.1</small></div>
     <nav class="nav">
       <a data-tab="dash" class="active">仪表盘</a>
       <a data-tab="sources">源管理</a>
@@ -131,7 +131,7 @@
       <a data-tab="settings">系统设置</a>
       <a data-tab="logs">运行日志</a>
     </nav>
-    <div class="ver" id="ver">v5.2.0</div>
+    <div class="ver" id="ver">v5.2.1</div>
   </aside>
 
   <main class="main">
@@ -222,6 +222,7 @@
       <div class="toolbar">
         <input id="chSearch" placeholder="搜索名称 / 分组…" oninput="loadChannels()">
         <button class="ghost" onclick="loadChannels()">刷新</button>
+        <button class="ghost" id="chCheckBtn" onclick="checkChannels()" title="逐个探测上游是否可用（先取播放列表，再试拉第一个分片），可一键停用不可用频道">检测可用性</button>
         <span class="muted" id="chCount"></span>
       </div>
       <div class="toolbar bulk-bar">
@@ -633,7 +634,10 @@ async function loadSources() {
     <td>${originLabel(s)}</td>
     <td>${s.channelCount || 0}</td>
     <td class="muted">${s.lastRefreshAt ? new Date(s.lastRefreshAt).toLocaleString('zh-CN') : '-'}</td>
-    <td>${s.error ? '<span class="badge err">'+esc(s.error)+'</span>' : '<span class="badge direct">正常</span>'}</td>
+    <td>${s.error
+      ? '<span class="badge err" title="'+esc(s.error)+'">失败</span>' +
+        '<div class="muted" style="font-size:12px;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:4px" title="'+esc(s.error)+'">'+esc(s.error.length>40?s.error.slice(0,40)+'…':s.error)+'</div>'
+      : '<span class="badge direct">正常</span>'}</td>
     <td>
       <button class="ghost sm" onclick="refreshSrc('${s.id}')">刷新</button>
       <button class="danger sm" onclick="delSrc('${s.id}')">删除</button>
@@ -733,6 +737,46 @@ function toggleSelectAll(src) {
   if (top)  { top.checked = on;  top.indeterminate = false; }
   document.querySelectorAll('.ch-cb').forEach(cb => { cb.checked = on; });
   updateSelCount();
+}
+// 频道可用性检测：启动后台探测 → 轮询进度 → 结束后可一键停用不可用频道
+let checkTimer = null;
+async function checkChannels() {
+  const st = await (await fetch('/api/channels/check')).json();
+  if (st.running) { pollCheck(); return; }
+  const q = document.getElementById('chSearch').value.trim();
+  const scope = q ? `当前搜索结果（关键词「${q}」）里的启用频道` : '全部启用频道';
+  if (!confirm(`将逐个探测${scope}的上游是否可用（并发 6，1000 个频道约 3~8 分钟）。\n检测期间仍可正常观看，只是会占用一些出口带宽。\n\n开始检测？`)) return;
+  const payload = { all: true };
+  if (q) payload.q = q;
+  const r = await fetch('/api/channels/check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+  const d = await r.json();
+  if (!r.ok) { alert(d.error || '检测启动失败'); return; }
+  pollCheck();
+}
+async function pollCheck() {
+  if (checkTimer) clearInterval(checkTimer);
+  const btn = document.getElementById('chCheckBtn');
+  const tick = async () => {
+    let st;
+    try { st = await (await fetch('/api/channels/check')).json(); } catch { return; }
+    if (btn) btn.textContent = st.running ? `检测中 ${st.done}/${st.total}` : '检测可用性';
+    if (st.running) return;
+    clearInterval(checkTimer); checkTimer = null;
+    await loadChannels();
+    const msg = `检测完成：可用 ${st.ok} / 共 ${st.total}，不可用 ${st.badCount}。`;
+    if (!st.badCount) { alert(msg); return; }
+    if (confirm(msg + '\n\n是否把不可用频道批量停用（从播放列表隐藏，可随时重新启用）？')) {
+      const r = await fetch('/api/channels/batch', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: st.badIds, action: 'disable' }),
+      });
+      if (r.ok) { await loadChannels(); alert(`已停用 ${st.badCount} 个不可用频道。`); }
+      else alert('停用失败，请重试');
+    }
+  };
+  btn && (btn.textContent = '检测中…');
+  checkTimer = setInterval(tick, 1500);
+  tick();
 }
 async function bulkAction(action) {
   const ids = getCheckedIds();
