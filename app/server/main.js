@@ -42,7 +42,7 @@ function toAsciiHost(input) {
   return s;
 }
 
-const APP_VERSION = '5.2.1';
+const APP_VERSION = '5.2.2';
 
 // ---------------------------------------------------------------------------
 // 路径与配置
@@ -98,6 +98,19 @@ const DEFAULT_CONFIG = {
   logBufferSize: 800,             // 内存日志缓冲条数（v4.1.1 调大，便于排障）
   maxConcurrentUpstreams: 6,      // 全局同时回源的分片连接数上限（v4.1.9 从3提到6，支持5路终端并发不排队）
   segmentUpstreamTimeoutMs: 30000,// 分片回源 socket 无数据静默超时（v4.1.9 从≈10s放宽到30s，避免4K大分片被误杀）
+  // v5.2.2 内存治理（现场：连续播放一夜后 RSS 6.3GB，而 JS 堆只有 74MB，全是堆外 Buffer）
+  //  根因是几条「无界」路径：①分片 URL 实际是永不结束的流时 inflight.chunks 无上限累积；
+  //  ②N 个会话各自可缓存 96MB 且没有全局预算；③active>0 但从未送达分片的「僵尸会话」
+  //  永远不会被回收（旧逻辑要求 lastSegServedAt 有值），且因判定为「不可见」不打汇总日志。
+  maxInflightMB: 64,              // 单个分片在途下载字节上限(MB)：超出即中止回源，防永不结束的分片/流
+  maxInflightMs: 180000,          // 单个分片在途下载最长存活(ms)：超时即中止（挂死连接）
+  inflightStallMs: 20000,         // 在途下载无新数据超过此时长(ms)即判定 stall 并中止
+  segCacheMaxMB: 24,              // 超过此大小的分片不写缓存（4K 54MB 分片实测命中率恒为 0，只直传）
+  globalCacheMB: 192,             // 全部会话分片缓存的总字节上限(MB)，超出按最久未用跨会话淘汰
+  memSoftLimitMB: 700,            // RSS 软上限：超出则清空闲会话缓存 + 中止停滞回源
+  memHardLimitMB: 1300,           // RSS 硬上限：超出且当前无观众时自动退出，由守护循环 3s 内拉起
+  memForceLimitMB: 2600,          // 绝对上限：即使有人在看也重启，优先保护 NAS 整机
+  memDiagIntervalMs: 300000,      // 内存诊断日志周期(ms)，空闲时也会记录一次
   // 多线路播放列表（对标 xTeVe，PC 客户端依赖）：
   // 内网 IPv4 默认启用（host 留空自动用本机 LAN IP）；IPv6 DDNS / FRP 中转默认关闭
   lineInner: { enabled: true, host: '', port: PORT },
@@ -126,6 +139,9 @@ if (!config.sessionTtlMs || config.sessionTtlMs < 90000) config.sessionTtlMs = 9
 
 // 内存日志缓冲
 const logs = [];
+// 全局分片缓存账本（跨会话）：旧版每个会话各自可缓存 96MB，N 个会话叠加没有任何上限，
+// 是 RSS 长到数 GB 的主因之一。所有 put/evict/destroy 都同步维护这个总量。
+const CACHE_STATE = { bytes: 0 };
 function log(level, msg, extra) {
   const entry = {
     t: Date.now(),
@@ -1161,28 +1177,34 @@ class SegmentSession {
   }
 
   put(key, url, buffer, contentType) {
-    if (this.segs.has(key)) {
-      // 覆盖已存在项，先减去旧值字节数
-      const old = this.segs.get(key);
-      this.cacheBytes -= (old && old.buffer ? old.buffer.length : 0);
+    // v5.2.2：大分片不进缓存。4K 单分片 40~60MB，缓存里最多躺 1 片（实测 hit 恒为 0），
+    // 却要额外占住 1~2 倍内存（chunks + Buffer.concat 结果），并使整个会话缓存被挤成 1 片。
+    // 直接直传播放器，缓存放给真正能命中的高清小分片。
+    const cacheMaxSeg = (config.segCacheMaxMB > 0 ? config.segCacheMaxMB : 24) * 1024 * 1024;
+    if (!buffer || buffer.length > cacheMaxSeg) {
+      if (this.segs.has(key)) this.evict(key);
+      return;
     }
+    if (this.segs.has(key)) this.evict(key);
     this.segs.set(key, { buffer, contentType, at: Date.now(), url });
     this.cacheBytes += buffer.length;
+    CACHE_STATE.bytes += buffer.length;
     if (!this.order.includes(key)) this.order.push(key);
     const maxBytes = config.maxCacheBytes || (96 * 1024 * 1024);
     while ((this.order.length > config.cacheWindow || this.cacheBytes > maxBytes) && this.order.length > 1) {
       const oldKey = this.order.shift();
-      if (this.segs.has(oldKey)) {
-        const it = this.segs.get(oldKey);
-        this.cacheBytes -= (it && it.buffer ? it.buffer.length : 0);
-        if (oldKey !== key) this.segs.delete(oldKey);
-      }
+      if (oldKey !== key) this.evict(oldKey);
     }
+    trimGlobalCache();
   }
 
   evict(key) {
     const it = this.segs.get(key);
-    if (it) this.cacheBytes -= (it.buffer ? it.buffer.length : 0);
+    if (it) {
+      const len = it.buffer ? it.buffer.length : 0;
+      this.cacheBytes -= len;
+      CACHE_STATE.bytes = Math.max(0, CACHE_STATE.bytes - len);
+    }
     this.segs.delete(key);
     const i = this.order.indexOf(key);
     if (i >= 0) this.order.splice(i, 1);
@@ -1212,6 +1234,10 @@ class SegmentSession {
   //   单/多路都流畅，故移除。大分片自适应深度(4K 只预取1片)保留，避免 54MB 分片额外占带宽。
   _prefetchAllowed() {
     if (this.destroyed || !this.hasRecentViewer()) return false;
+    // v5.2.2：大于缓存阈值的分片（4K 40~60MB 级）put() 会直接丢弃不缓存，
+    // 预取它们既没有任何命中收益，又要多占一份内存与带宽，直接关掉预取。
+    const cacheMaxSeg = (config.segCacheMaxMB > 0 ? config.segCacheMaxMB : 24) * 1024 * 1024;
+    if ((this._avgSegBytes || 0) > cacheMaxSeg) return false;
     return true;
   }
   _prefetchDepth() {
@@ -1309,6 +1335,7 @@ class SegmentSession {
       streamers: 0, chunks: [], bytes: 0, aborted: false, finished: false,
       clients: [], contentType: 'video/mp2t', startedAt: t0, slowClient: false,
       resolve: null, reject: null, promise: null, upstream: null,
+      lastDataAt: t0, aborter: null,
     };
     inflight.promise = new Promise((resolve, reject) => {
       inflight.resolve = resolve;
@@ -1331,7 +1358,24 @@ class SegmentSession {
       inflight.contentType = h['content-type'] || 'video/mp2t';
       inflight.upstream = up;
       inflight.startedAt = Date.now();
+      inflight.lastDataAt = Date.now();
       let backpressureSince = 0;
+
+      // v5.2.2：在途分片统一中止入口（超大 / 停滞 / 会话销毁都走这里）。
+      // 关键点：立刻把 chunks 数组清空——旧版只 destroy 上游，已缓冲的几十 MB
+      // 要等 GC 才回收；4K 场景下一条永不结束的「分片」就能把 RSS 顶到数 GB。
+      inflight.aborter = (reason) => {
+        if (inflight.aborted || inflight.finished) return;
+        inflight.aborted = true;
+        inflight.chunks.length = 0;
+        try { up.destroy(); } catch {}
+        for (const c of inflight.clients) { try { if (c.headerSent) c.res.destroy(); } catch {} }
+        inflight.clients = [];
+        this.streaming.delete(key);
+        const e = new Error(reason);
+        e.code = 'XTE_INFLIGHT_ABORT';
+        try { inflight.reject(e); } catch {}
+      };
 
       // 注意：v4.1.3 曾在这里对「持续背压 8s」的客户端强杀上游，实测会误杀正常按 HLS 节奏消费的播放器
       // （尤其 4K 大分片，播放器边下边解，write() 返回 false 是常态而非异常），导致分片被截断、
@@ -1359,7 +1403,19 @@ class SegmentSession {
 
       up.on('data', (chunk) => {
         if (inflight.aborted) return;
+        inflight.lastDataAt = Date.now();
         inflight.bytes += chunk.length;
+        // v5.2.2：单个分片的在途缓冲硬上限。分片 URL 若实际是「永不结束的直播流」
+        // 或源站不按 Content-Length 收尾，chunks 会以回源速度无限增长（实测一条 4MB/s
+        // 的假分片 60s 就把 RSS 顶到 325MB，持续一夜即 GB 级）。超限立刻中止，播放器重试下一片。
+        const capBytes = (config.maxInflightMB > 0 ? config.maxInflightMB : 64) * 1024 * 1024;
+        if (inflight.bytes > capBytes) {
+          log('warn', '分片超出在途上限，已中止回源 session=' + this.id,
+            { key: shortKey(key), bytes: inflight.bytes, limitMB: Math.round(capBytes / 1024 / 1024),
+              channel: (this.chan && this.chan.name) || '', contentType: inflight.contentType });
+          inflight.aborter('segment-too-large');
+          return;
+        }
         inflight.chunks.push(chunk);
         for (const c of inflight.clients) {
           try {
@@ -1396,6 +1452,8 @@ class SegmentSession {
         if (inflight.aborted) return;
         inflight.finished = true;
         const buffer = Buffer.concat(inflight.chunks);
+        // v5.2.2：拼接完成后立刻释放分块引用，避免「chunks + concat 结果」长期双份占内存
+        inflight.chunks.length = 0;
         // EWMA 记录最近分片体积，用于自适应预取深度（>20MB 视为 4K 大分片，只预取1片）
         this._avgSegBytes = this._avgSegBytes ? this._avgSegBytes * 0.7 + inflight.bytes * 0.3 : inflight.bytes;
         this.put(key, url, buffer, inflight.contentType);
@@ -1593,10 +1651,14 @@ class SegmentSession {
 
   destroy({ closeClients = false } = {}) {
     this.destroyed = true;
+    CACHE_STATE.bytes = Math.max(0, CACHE_STATE.bytes - this.cacheBytes);
     this.segs.clear();
     this.order = [];
     this.cacheBytes = 0;
-    for (const inf of this.streaming.values()) {
+    for (const [key, inf] of this.streaming) {
+      inf.aborted = true;
+      // 释放已缓冲的字节：旧版只 destroy 上游，chunks 要等 GC，几百 MB 的大分片会长期驻留
+      try { inf.chunks.length = 0; } catch {}
       try { inf.upstream && inf.upstream.destroy(); } catch {}
       if (closeClients) {
         // stalled 自动恢复：主动断开挂死的播放器连接，触发播放器重连重建会话
@@ -1604,9 +1666,15 @@ class SegmentSession {
           try { c.res && c.res.destroy(); } catch {}
         }
       }
+      try { inf.reject(new Error('session-destroyed')); } catch {}
+      this.streaming.delete(key);
     }
     this.streaming.clear();
     this._prefQueue = [];
+    // 旧版漏清这些引用：会话虽已从 sessions 删除，字符串/键集合仍可能被别处引用而驻留
+    try { this.badKeys && this.badKeys.clear(); } catch {}
+    this.lastSegs = null;
+    this.playlistRaw = null;
   }
 }
 
@@ -1772,6 +1840,27 @@ function detectLine(req, ip) {
 
 const sessions = new Map(); // channelUrl -> SegmentSession
 
+// 全局分片缓存淘汰：所有会话合计超过 globalCacheMB 时，跨会话按「最久未使用」淘汰，
+// 直到降到上限的 80%。旧版只有每会话 96MB 的上限，N 路会话叠加无上限。
+function trimGlobalCache() {
+  const limit = (config.globalCacheMB > 0 ? config.globalCacheMB : 192) * 1024 * 1024;
+  if (CACHE_STATE.bytes <= limit) return 0;
+  const items = [];
+  for (const s of sessions.values()) {
+    if (s.destroyed) continue;
+    for (const [key, it] of s.segs) items.push({ s, key, at: (it && it.at) || 0, len: (it && it.buffer) ? it.buffer.length : 0 });
+  }
+  items.sort((a, b) => a.at - b.at);
+  const target = Math.floor(limit * 0.8);
+  let freed = 0;
+  for (const it of items) {
+    if (CACHE_STATE.bytes <= target) break;
+    it.s.evict(it.key);
+    freed += it.len;
+  }
+  return freed;
+}
+
 function getOrCreateSession(channelUrl, chan) {
   let s = sessions.get(channelUrl);
   if (!s) {
@@ -1822,11 +1911,137 @@ function reapSessions() {
             memMB: Math.round(process.memoryUsage().rss / 1024 / 1024) });
         s.destroy({ closeClients: true });
         sessions.delete(url);
+        continue;
       }
+    }
+    // v5.2.2 僵尸会话兜底：旧逻辑只在「active<=0」或「lastSegServedAt 有值」时回收，
+    // 于是 active>0 且从未送达过分片的会话（播放器连上就挂死）永远不会被回收；
+    // 它又被汇总日志判为「不可见」而不留痕，能挂一整夜持续吃内存。
+    // 判定用「最后一次真实活动」：客户端请求 / 分片送达 / 在途下载还有数据在流，
+    // 三者取最新——正常慢速播放大分片（4K 54MB 慢慢下）不会被打断，纯挂死连接才会命中。
+    let lastInflightAt = 0;
+    for (const inf of s.streaming.values()) {
+      if (inf && inf.lastDataAt > lastInflightAt) lastInflightAt = inf.lastDataAt;
+    }
+    const lastAny = Math.max(s.lastClientAt || 0, s.lastSegServedAt || 0, lastInflightAt);
+    if (now - lastAny > stalledLimit) {
+      log('warn', '会话长时间无任何活动（疑似挂死连接），强制回收 session=' + s.id,
+        { channel: (s.chan && s.chan.name) || '', idleMs: now - lastAny, active: s.active,
+          buffered: s.segs.size, streaming: s.streaming.size,
+          memMB: Math.round(process.memoryUsage().rss / 1024 / 1024) });
+      s.destroy({ closeClients: true });
+      sessions.delete(url);
+      continue;
     }
   }
 }
 setInterval(reapSessions, 8000).unref?.();
+
+// 在途分片清扫（v5.2.2）：无数据过久（inflightStallMs）或存活过久（maxInflightMs）的分片
+// 一律中止并释放缓冲。这是「分片 URL 实际是永不结束的流 / 源站挂住不收尾」这类场景的最后一道闸。
+function sweepInflight() {
+  const now = Date.now();
+  const stallMs = config.inflightStallMs > 0 ? config.inflightStallMs : 20000;
+  const maxAge = config.maxInflightMs > 0 ? config.maxInflightMs : 180000;
+  for (const s of sessions.values()) {
+    if (s.destroyed || !s.streaming.size) continue;
+    for (const [key, inf] of s.streaming) {
+      if (!inf || inf.finished || inf.aborted) continue;
+      const idle = now - (inf.lastDataAt || inf.startedAt || now);
+      const age = now - (inf.startedAt || now);
+      if (idle > stallMs || age > maxAge) {
+        log('warn', '在途分片超时中止 session=' + s.id,
+          { key: shortKey(key), reason: idle > stallMs ? 'stall' : 'age', idleMs: idle, ageMs: age,
+            bytes: inf.bytes, clients: (inf.clients || []).length,
+            memMB: Math.round(process.memoryUsage().rss / 1024 / 1024) });
+        if (typeof inf.aborter === 'function') inf.aborter('inflight-timeout');
+        else {
+          inf.aborted = true;
+          try { inf.chunks.length = 0; } catch {}
+          try { inf.upstream && inf.upstream.destroy(); } catch {}
+          s.streaming.delete(key);
+          try { inf.reject(new Error('inflight-timeout')); } catch {}
+        }
+      }
+    }
+  }
+}
+setInterval(sweepInflight, 5000).unref?.();
+
+// 内存快照：把「堆内 / 堆外 / 在途缓冲 / 缓存 / 会话数」分开统计，便于一眼看出是谁吃的内存。
+function memSnapshot() {
+  const m = process.memoryUsage();
+  let inflightBytes = 0, inflightCount = 0;
+  for (const s of sessions.values()) {
+    if (s.destroyed) continue;
+    for (const inf of s.streaming.values()) {
+      inflightBytes += inf.bytes || 0;
+      inflightCount++;
+    }
+  }
+  return {
+    rssMB: Math.round(m.rss / 1024 / 1024),
+    heapMB: Math.round(m.heapUsed / 1024 / 1024),
+    extMB: Math.round((m.external || 0) / 1024 / 1024),
+    abMB: Math.round((m.arrayBuffers || 0) / 1024 / 1024),
+    sessions: sessions.size,
+    inflightCount,
+    inflightMB: Math.round(inflightBytes / 1024 / 1024),
+    cacheMB: Math.round(CACHE_STATE.bytes / 1024 / 1024),
+  };
+}
+
+// 内存看门狗（v5.2.2 新增）：软上限清理 → 硬上限自愈重启 → 绝对上限强制重启。
+// 飞牛现网实测过 6.3GB 的 RSS（JS 堆只有 74MB）。无论剩余泄漏点在哪，
+// 这里保证进程内存有硬天花板：无观众时超线立即重启（守护循环 3s 内拉起），
+// 有人在看则只在绝对上限处重启，避免打断播放。
+let memLastCleanupLogAt = 0;
+function memWatchdogTick() {
+  const soft = config.memSoftLimitMB > 0 ? config.memSoftLimitMB : 700;
+  const hard = config.memHardLimitMB > 0 ? config.memHardLimitMB : 1300;
+  const force = config.memForceLimitMB > 0 ? config.memForceLimitMB : 2600;
+  const snap = memSnapshot();
+  if (snap.rssMB <= soft) return;
+  let freed = 0;
+  for (const s of sessions.values()) {
+    if (s.destroyed || s.hasRecentViewer()) continue;
+    const before = CACHE_STATE.bytes;
+    for (const key of Array.from(s.segs.keys())) s.evict(key);
+    freed += before - CACHE_STATE.bytes;
+  }
+  trimGlobalCache();
+  sweepInflight();
+  const after = memSnapshot();
+  // 日志节流：RSS 长期停在软上限之上时，2 分钟才记一条，避免刷屏
+  const nowMs = Date.now();
+  if (nowMs - memLastCleanupLogAt > 120000) {
+    memLastCleanupLogAt = nowMs;
+    log(snap.rssMB > hard ? 'warn' : 'info', '内存超过软上限，已清理空闲缓存',
+      Object.assign({}, after, { freedCacheMB: Math.round(freed / 1024 / 1024), softLimit: soft }));
+  }
+  if (after.rssMB > force) {
+    log('error', '内存超过绝对上限，立即重启进程以保护系统', Object.assign({}, after, { limit: force }));
+    setTimeout(() => process.exit(1), 300);
+    return;
+  }
+  if (after.rssMB > hard) {
+    const viewers = countActiveViewers();
+    if (viewers === 0) {
+      log('warn', '内存超过硬上限且当前无观众，自动重启进程（守护循环 3s 内拉起）',
+        Object.assign({}, after, { limit: hard }));
+      setTimeout(() => process.exit(0), 300);
+    } else {
+      log('warn', '内存超过硬上限但仍有 ' + viewers + ' 位观众在观看，暂不重启',
+        Object.assign({}, after, { limit: hard, viewers }));
+    }
+  }
+}
+setInterval(memWatchdogTick, 15000).unref?.();
+
+// 周期性内存诊断日志：空闲时也记录，下次再出现异常增长可直接对照时间线。
+setInterval(() => {
+  log('info', '内存诊断', memSnapshot());
+}, (config.memDiagIntervalMs > 0 ? config.memDiagIntervalMs : 300000)).unref?.();
 
 // 活跃直播会话后台保活：周期性刷新索引，让播放器拿到最新清单。
 // v4.1.1：refresh 内部已有节流（refreshMinIntervalMs），保活只负责维持索引新鲜，
@@ -2054,7 +2269,7 @@ function channelCheckStatus() {
 }
 
 async function probeChannel(ch) {
-  const UA = { 'User-Agent': 'Mozilla/5.0 (XTE-IPTV/5.2.1; +health-check)' };
+  const UA = { 'User-Agent': 'Mozilla/5.0 (XTE-IPTV/5.2.2; +health-check)' };
   try {
     if (isProgressiveMedia(ch.url)) {
       const r = await fetchUpstream(ch.url, { headers: Object.assign({ Range: 'bytes=0-1023' }, UA), timeoutMs: 8000 });
@@ -2207,6 +2422,7 @@ async function handleApi(req, res, parsed) {
       sessionCount: sessions.size,
       uptimeSec: Math.round(process.uptime()),
       memMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
+      mem: memSnapshot(),
       downloads: {
         active: DOWNLOAD_SCHED.activeCount(),
         queued: DOWNLOAD_SCHED.queued(),

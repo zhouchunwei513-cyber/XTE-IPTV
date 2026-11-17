@@ -1,8 +1,37 @@
-# XTE-IPTV 直播代理 (FPK) v5.2.1
+# XTE-IPTV 直播代理 (FPK) v5.2.2
 
 ## 项目概览
 飞牛 NAS 上的 IPTV 直播代理服务。输出标准 HLS (m3u8 + TS)，无转码。
-- **v5.2.1（当前）：修复「导入源后电视直播看不了」+ 频道可用性检测**（实测对象：iFansClub 聚合源 852 频道 + 山西移动源 433 频道）
+- **v5.2.2（当前）：内存泄漏治理（现场 RSS 6.32GB，heap 仅 74MB）**
+  - **现场证据**：飞牛上运行 13h50m 后 RSS 6,624,732kB、`VmData` 6.9GB、34500 端口活动连接 **0**；
+    日志汇总行 `memRSS_MB` 2.3~2.4GB 而 `memHeap_MB` 仅 74MB → **堆外 Buffer 滞留**，不是 JS 堆泄漏。
+    最后一个会话 `北京卫视4K`（4K 单分片 50~54MB）`hit` 恒为 0、`miss` 142 → 大分片缓存纯占内存、零收益。
+  - **① 在途分片无上限（实测可复现）**：`fetchSegment` 把所有数据 `push` 进 `inflight.chunks`，只有上游 `end`
+    才 `Buffer.concat`；若分片 URL 实际是「永不结束的直播流」（源站异常/中继把 m3u8 当分片返回），内存按回源速度无限涨。
+    本机用 4MB/s 假分片复现：**60s 收到 238MB，RSS 123→325MB 线性上涨，断开后不回落**。
+    修复：`maxInflightMB`(64) 超限 → `aborter('segment-too-large')` 中止回源（播放器自动重试下一片）；
+    `sweepInflight()` 每 5s 清扫「20s 无新数据」(`inflightStallMs`) 或「存活 >180s」(`maxInflightMs`) 的在途下载。
+    **切勿再加「无限累积 chunks 再拼接」的写法。**
+  - **② 拼接后双份驻留**：`Buffer.concat` 后不释放 `chunks`，54MB 分片峰值占 ~108MB → 拼接后立即 `chunks.length = 0`。
+  - **③ 缓存无全局预算**：旧版仅每会话 96MB，N 路会话叠加无上限。新增全局账本 `CACHE_STATE.bytes` +
+    `globalCacheMB`(192) + `trimGlobalCache()`（超出按分片 `at` 升序跨会话淘汰至 80%）。
+    `put()`/`evict()`/`destroy()` 必须**同步维护** `CACHE_STATE.bytes`，漏一处就会算错预算。
+  - **④ 大分片不该进缓存**：`segCacheMaxMB`(24) 以上不写缓存、只直传；`_prefetchAllowed()` 对
+    `_avgSegBytes > segCacheMaxMB` 直接返回 false（大分片预取与实时流抢带宽且命中率为 0）。
+  - **⑤ 僵尸会话永不回收**：旧 `reapSessions()` 的 stalled 分支要求 `lastSegServedAt` 有值，于是「播放器连上就挂死
+    （active>0、从未送达分片）」的会话永久驻留，且 30s 汇总因 `visible=false` 不打日志 → 能挂一整夜。
+    修复：改用「最后真实活动」`max(lastClientAt, lastSegServedAt, inflight.lastDataAt)`，超 `stalledRecoverMs`(60s)
+    强制 `destroy({closeClients:true})`；`destroy()` 补清 `badKeys`/`lastSegs`/`playlistRaw` 并中止在途回源。
+  - **⑥ 内存看门狗（兜底未知泄漏）**：每 15s 采样；`memSoftLimitMB`(700) 清空闲会话缓存+中止停滞回源；
+    `memHardLimitMB`(1300) 且无人观看 → **自动退出**，`cmd/main` 守护循环 3s 内拉起；有观众只告警；
+    `memForceLimitMB`(2600) 即使有观众也退出，优先保整机。`/api/status` 新增 `mem` 明细
+    （rss/heap/external/arrayBuffers/会话数/在途字节/缓存字节），每 5 分钟写一条「内存诊断」日志。
+    `cmd/main` spawn node 时加 `MALLOC_ARENA_MAX=2`（抑制 glibc 多 arena 碎片虚高）。
+  - **实测**：40MB 大分片连播 4 分钟 RSS 87→255MB 后**完全持平**（旧版同场景持续上涨）；真 4K(3840x2160 hevc)
+    连播 3 分钟峰值 216MB、停止后缓存归零、hit 6/miss 26 正常；真 CCTV1 `ffprobe` h264+aac 无回归；
+    永不停歇假分片在 64MB 处被中止（RSS 137MB 持平）；看门狗阈值调 150/200MB 后三档日志与自动重启均按预期触发。
+
+- **v5.2.1：修复「导入源后电视直播看不了」+ 频道可用性检测**（实测对象：iFansClub 聚合源 852 频道 + 山西移动源 433 频道）
   - **① 全端不可播的根因——代理地址没有扩展名**：分片地址原为 `/proxy/ts?sid=..&url=..`，路径末尾无 `.ts`，
     ffmpeg 系 HLS 解析器命中 `allowed_segment_extensions` 白名单直接拒播
     （`URL ... is not in allowed_segment_extensions`，`ffmpeg -i /play/<id>.m3u8` 必现）。
@@ -104,6 +133,15 @@
 | segmentUpstreamTimeoutMs | targetDuration*1000≈10s | v5.0.1 回退对齐 v4.1.2（v4.1.9 曾放宽到 30s，但绕过调度器后无需）。socket 无数据静默超时，有数据到达自动重置 |
 | stalledRecoverMs | 60000 | stalled 自动恢复：有连接但超此时长无分片送达即断开重连（v4.1.7，0=关闭） |
 | DOWNLOAD_SCHED | 定义保留但分片回源不再使用 | v5.0.1 起 fetchSegment 直接 fetchUpstream，调度器对象保留仅为兼容状态接口/历史代码，不再排队或抢占 |
+| maxInflightMB | 64 | v5.2.2 单分片在途缓冲上限，超限中止回源（防「永不结束的分片」撑爆内存） |
+| maxInflightMs | 180000 | v5.2.2 在途分片最长存活时间，超时中止 |
+| inflightStallMs | 20000 | v5.2.2 在途分片「无新数据」判定阈值，`sweepInflight()` 每 5s 清扫 |
+| segCacheMaxMB | 24 | v5.2.2 超过此大小的分片不写缓存、只直传；同时关闭其预取 |
+| globalCacheMB | 192 | v5.2.2 跨会话分片缓存总预算（旧版只有每会话 96MB，无全局上限） |
+| memSoftLimitMB | 700 | v5.2.2 内存软化线：清空闲会话缓存 + 中止停滞回源 |
+| memHardLimitMB | 1300 | v5.2.2 硬线：无观众时自动退出，守护循环 3s 拉起；有观众只告警 |
+| memForceLimitMB | 2600 | v5.2.2 强制线：即使有观众也重启，优先保整机 |
+| memDiagIntervalMs | 300000 | v5.2.2 「内存诊断」日志周期（空闲时也写，便于对照时间线） |
 | KEEP_AGENT | maxSockets=128/maxFreeSockets=32/timeout=60000 | HTTP keep-alive 连接池（v4.1.4 已移除背压 8s 强杀，改为背压 pause/resume） |
 
 

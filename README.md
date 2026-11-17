@@ -2,7 +2,28 @@
 
 > 飞牛 NAS（fnOS）上的 IPTV 直播源统一管理与智能代理。标准 HLS 输出，**无转码、零第三方依赖**，手机 / 平板 / 电视 / 电脑全终端直接看。
 
-[![version](https://img.shields.io/badge/version-5.2.1-blue)]() [![license](https://img.shields.io/badge/license-MIT-green)]() [![runtime](https://img.shields.io/badge/runtime-Node.js-orange)]()
+[![version](https://img.shields.io/badge/version-5.2.2-blue)]() [![license](https://img.shields.io/badge/license-MIT-green)]() [![runtime](https://img.shields.io/badge/runtime-Node.js-orange)]()
+
+## v5.2.2 更新（重点：内存泄漏，RSS 曾涨到 6.3GB）
+
+现场现象：飞牛 NAS 上连续挂机一夜后，XTE 的 `node` 进程 RSS 达 **6.32GB**（JS 堆只有 74MB，34500 端口连接数为 0），
+整机可用内存被挤到 1GB。原因是堆外 Buffer 滞留 —— 不是 JS 堆泄漏，而是几条「无界」路径叠加。
+
+| # | 无界路径 | 后果 | 修复 |
+|---|---------|------|------|
+| 1 | 分片在途缓冲 `inflight.chunks` 没有上限，只有上游 `end` 才拼接 | 分片地址若是「永不结束的直播流」，内存按回源速度无限涨（本机 4MB/s 假分片 60s 顶到 325MB） | `maxInflightMB`（默认 64MB）超限即中止；每 5s 清扫「20s 无数据 / 存活 180s」的在途分片 |
+| 2 | `Buffer.concat` 后不释放 `chunks` | 54MB 分片峰值占 ~108MB | 拼接后立即清空 `chunks` |
+| 3 | 每会话缓存 96MB，**没有全局预算** | N 路会话叠加无上限 | 新增跨会话总预算 `globalCacheMB`（192MB），超出按最久未用淘汰 |
+| 4 | 4K 大分片也进缓存 | 现场日志 `hit:0, miss:142`：命中率恒为 0，却白占 1~2 倍内存 | `segCacheMaxMB`（24MB）以上不缓存、只直传；这类分片的预取一并关闭 |
+| 5 | 僵尸会话永不回收 | `active>0` 且从未送达分片的会话能挂一整夜，且不打日志 | 以「最后真实活动」判定，超 60s 一律销毁并断开挂死连接 |
+
+**兜底：内存看门狗** — `/api/status` 新增 `mem` 明细；每 5 分钟写一条「内存诊断」日志；
+RSS 超 `memSoftLimitMB`(700) 清空闲缓存与停滞回源；超 `memHardLimitMB`(1300) 且无人观看时**自动重启**
+（守护循环 3s 内拉起）；超 `memForceLimitMB`(2600) 即使有人在看也重启，优先保整机。
+启动脚本附加 `MALLOC_ARENA_MAX=2`，抑制 glibc 多 arena 碎片。
+
+> 实测：40MB 大分片连播 4 分钟 RSS 87→255MB 后完全持平；真 4K（3840x2160 hevc）连播 3 分钟峰值 216MB、
+> 停止后缓存归零；真 CCTV1 1080p 播放与预取命中无回归。
 
 ## v5.2.1 更新（重点：修复「导入源后电视直播看不了」）
 
