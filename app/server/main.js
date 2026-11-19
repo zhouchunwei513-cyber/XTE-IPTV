@@ -42,7 +42,7 @@ function toAsciiHost(input) {
   return s;
 }
 
-const APP_VERSION = '5.2.3';
+const APP_VERSION = '5.2.4';
 
 // ---------------------------------------------------------------------------
 // 路径与配置
@@ -530,10 +530,11 @@ function channelPlayUrl(base, ch, line) {
 }
 
 // 单线路播放列表：每频道一个播放地址（HLS 走 /play，渐进式媒体走 /proxy/ts）
-function buildLinePlaylist(base, list, line) {
+function buildLinePlaylist(base, list, line, allowAll) {
   const lines = ['#EXTM3U', '#PLAYLIST:XTE-IPTV'];
   let skipped = 0;
-  for (const ch of list) {
+  // v5.2.4：同名多源只输出当前最优的那一个（?multi=all 可关闭去重）
+  for (const ch of dedupeChannels(list, allowAll)) {
     if (ch.enabled === false) { skipped++; continue; }
     lines.push(buildChannelExtinf(ch));
     lines.push(channelPlayUrl(base, ch, line));
@@ -542,10 +543,10 @@ function buildLinePlaylist(base, list, line) {
 }
 
 // 三线路合并列表：每频道三条线路地址，标注 [内网]/[IPv6]/[FRP]
-function buildMergedPlaylist(bases, list) {
+function buildMergedPlaylist(bases, list, allowAll) {
   const lines = ['#EXTM3U', '#PLAYLIST:XTE-IPTV-ALL'];
   const labels = { inner: '内网', ipv6: 'IPv6', frp: 'FRP' };
-  for (const ch of list) {
+  for (const ch of dedupeChannels(list, allowAll)) {
     if (ch.enabled === false) continue;
     for (const kind of ['inner', 'ipv6', 'frp']) {
       const base = bases[kind]; if (!base) continue;
@@ -955,6 +956,21 @@ function isHlsPlaylistText(text) {
   // 多码率主清单 #EXT-X-STREAM-INF。像 iFansClub 把「频道列表」当播放列表返回的情况
   // （只有 #EXTM3U + #EXTINF + x-tvg-url），必须判为非 HLS，否则播放器解析出的是频道表。
   return /#EXT-X-(TARGETDURATION|STREAM-INF|MEDIA-SEQUENCE|PLAYLIST-TYPE|ENDLIST)/i.test(t);
+}
+
+// 从多码率主清单（#EXT-X-STREAM-INF）里取第一个子清单地址
+function firstVariantUri(text, baseUrl) {
+  const lines = String(text || '').split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].trim().startsWith('#EXT-X-STREAM-INF')) continue;
+    for (let j = i + 1; j < lines.length; j++) {
+      const l = lines[j].trim();
+      if (!l) continue;
+      if (l.startsWith('#')) { if (l.startsWith('#EXT-X-STREAM-INF')) break; continue; }
+      return absUrl(l, baseUrl);
+    }
+  }
+  return '';
 }
 
 // 解析分片 m3u8（含序号、是否直播）
@@ -2244,6 +2260,7 @@ async function refreshSource(src) {
     src.lastRefreshAt = Date.now();
     src.channelCount = newChannels.length;
     src.error = '';
+    invalidateGroups();   // 频道集合变了，多源分组缓存作废
     persistSources();
     persistChannels();
     log('info', '源刷新完成 ' + src.name,
@@ -2403,6 +2420,264 @@ function qualityBySource() {
   return out;
 }
 
+// ==================== 多源优选（v5.2.4） ====================
+// 同一个频道在多个源里都有条目（CCTV1 大苏打一份、大苏打的再一份，码率/稳定性各不相同）。
+// 这里把「归一化后同名」的频道聚成一组：播放列表每组只输出当前最优的那一个，
+// 播放失败自动切到组内下一个可用源，也可以在频道管理页把某个源锁定（pin）。
+const GROUPS_FILE = path.join(DATA_DIR, 'groups.json');
+const GROUP_PREF = Object.assign(
+  { enabled: true, dedupe: true, autoFailover: true, pin: {}, lastGood: {} },
+  loadJson(GROUPS_FILE, {})
+);
+if (!GROUP_PREF.pin || typeof GROUP_PREF.pin !== 'object') GROUP_PREF.pin = {};
+if (!GROUP_PREF.lastGood || typeof GROUP_PREF.lastGood !== 'object') GROUP_PREF.lastGood = {};
+function persistGroups() {
+  try { saveJson(GROUPS_FILE, GROUP_PREF); } catch (e) { log('warn', '保存多源优选配置失败', { error: e.message }); }
+}
+const GROUP_RUNTIME = new Map();   // groupKey -> { currentId, switchedAt, from, reason }
+const groupFail = new Map();       // channelId -> { count, at, reasons: [...] }
+const GROUP_THRESHOLD = 2;         // 窗口内失败达到该次数就切换
+const GROUP_FAIL_WINDOW = 180000;  // 失败计数窗口 3 分钟
+
+// 频道名归一：全角转半角、去括号、剥清晰度/线路后缀、去标点空白、小写
+// CCTV1 / CCTV1高清 / CCTV-1 / ＣＣＴＶ1 → cctv1；北京卫视4K / 北京卫视 → 北京卫视
+const QUALITY_WORD_RE = /(超高清|超清|高清|标清|蓝光|原画|4k|8k|uhd|fhd|hd|sd|plus|备用|测试|线路\d?)/gi;
+const JUNK_NAME_RE = /^(未知频道|未知|未命名|频道\d*|new|test|demo)$/i;
+function normChannelName(s) {
+  let t = String(s == null ? '' : s);
+  t = t.replace(/[\uFF01-\uFF5E]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)).replace(/\u3000/g, ' ');
+  t = t.replace(/[()\[\]{}【】（）<>《》]/g, ' ');
+  t = t.replace(QUALITY_WORD_RE, ' ');
+  t = t.replace(/[\s\u00b7_\-，,。.：:、|/\\*'"!?~`]+/g, '');
+  return t.toLowerCase();
+}
+// 分组键：优先归一名（最稳，用户说的「同一个频道」就是同名），其次 tvg-id，最后退回 url（不参与聚合）
+function groupKeyOf(ch) {
+  if (!ch) return 'u:';
+  const n = normChannelName(ch.name || ch.tvgName || '');
+  if (n && n.length >= 2 && !JUNK_NAME_RE.test(n)) return 'n:' + n;
+  const tid = normChannelName(ch.tvgId || ch.tvgName || '');
+  if (tid && !JUNK_NAME_RE.test(tid)) return 'id:' + tid;
+  return 'u:' + String(ch.url || ch.id || '');
+}
+
+let _groupRef = null, _groupVer = -1, _groupLen = -1, _groupMap = null, GROUP_GEN = 0;
+function invalidateGroups() { GROUP_GEN++; }
+function channelGroupMap() {
+  if (_groupRef === channels && _groupVer === GROUP_GEN && _groupLen === channels.length) return _groupMap;
+  const map = new Map();
+  for (const c of channels) {
+    const k = groupKeyOf(c);
+    let g = map.get(k);
+    if (!g) { g = { key: k, name: c.name || c.tvgName || c.url, members: [] }; map.set(k, g); }
+    g.members.push(c);
+  }
+  _groupRef = channels; _groupVer = GROUP_GEN; _groupLen = channels.length; _groupMap = map;
+  return map;
+}
+function groupOf(ch) { return ch ? (channelGroupMap().get(groupKeyOf(ch)) || null) : null; }
+function isMultiGroup(g) { return !!g && g.members.length > 1; }
+
+// 组内排序：近期失败最少 → 质量（优秀>一般>未检测>失效）→ 码率高 → 响应快 → 原始顺序
+function groupMemberScore(c) {
+  const q = CHANNEL_CHECK.quality.get(c.id) || null;
+  let st = 1.5;
+  if (q) st = q.state === 'good' ? 3 : q.state === 'fair' ? 2 : 0;
+  const f = groupFail.get(c.id);
+  const recentFail = f && Date.now() - f.at < 120000 ? f.count : 0;
+  return { recentFail, st, kbps: (q && q.kbps) || 0, ms: (q && q.ms) || 99999 };
+}
+function sortGroupMembers(g, excludeId) {
+  return g.members
+    .filter((c) => c.enabled !== false && c.id !== excludeId)
+    .map((c, i) => ({ c, i, s: groupMemberScore(c) }))
+    .sort((a, b) =>
+      (a.s.recentFail - b.s.recentFail) ||
+      (b.s.st - a.s.st) ||
+      (b.s.kbps - a.s.kbps) ||
+      (a.s.ms - b.s.ms) ||
+      (a.i - b.i))
+    .map((x) => x.c);
+}
+function groupCurrent(g) {
+  if (!g) return null;
+  if (!isMultiGroup(g)) return g.members[0] || null;
+  const pin = GROUP_PREF.pin[g.key];
+  if (pin) {
+    const m = g.members.find((c) => c.id === pin);
+    if (m && m.enabled !== false) return m;
+  }
+  const rt = GROUP_RUNTIME.get(g.key);
+  if (rt && rt.currentId) {
+    const m = g.members.find((c) => c.id === rt.currentId);
+    if (m && m.enabled !== false) return m;
+  }
+  const best = sortGroupMembers(g)[0] || g.members.find((c) => c.enabled !== false) || g.members[0] || null;
+  if (best && !rt) GROUP_RUNTIME.set(g.key, { currentId: best.id, switchedAt: 0, reason: 'auto-init' });
+  return best;
+}
+
+// 播放列表去重：每个多源组只留当前最优频道（allowAll=true 时原样输出全部源）
+function dedupeChannels(list, allowAll) {
+  if (allowAll || !GROUP_PREF.enabled || !GROUP_PREF.dedupe) return list;
+  const map = channelGroupMap();
+  const seen = new Set();
+  const out = [];
+  for (const c of list) {
+    const g = map.get(groupKeyOf(c));
+    if (!isMultiGroup(g)) { out.push(c); continue; }
+    if (seen.has(g.key)) continue;
+    seen.add(g.key);
+    const cur = groupCurrent(g);
+    if (cur) out.push(cur);
+  }
+  return out;
+}
+function groupsSummary() {
+  const map = channelGroupMap();
+  let multi = 0, involved = 0;
+  for (const g of map.values()) { if (isMultiGroup(g)) { multi++; involved += g.members.length; } }
+  return {
+    enabled: !!GROUP_PREF.enabled,
+    dedupe: !!GROUP_PREF.dedupe,
+    autoFailover: !!GROUP_PREF.autoFailover,
+    multi,
+    involved,
+    output: channels.length - involved + multi,
+  };
+}
+
+// 故障计票：窗口内达到阈值就切到组内下一个可用源；成功播放清零
+function noteGroupFailure(ch, reason, immediate) {
+  if (!ch || !GROUP_PREF.enabled || !GROUP_PREF.autoFailover) return false;
+  const g = groupOf(ch);
+  if (!isMultiGroup(g)) return false;
+  const now = Date.now();
+  let f = groupFail.get(ch.id);
+  if (!f || now - f.at > GROUP_FAIL_WINDOW) f = { count: 0, at: 0, reasons: [] };
+  f.count++; f.at = now;
+  f.reasons.push(String(reason || '').slice(0, 80));
+  if (f.reasons.length > 3) f.reasons = f.reasons.slice(-3);
+  groupFail.set(ch.id, f);
+  const need = immediate ? 1 : GROUP_THRESHOLD;
+  if (f.count < need) return false;
+  if (GROUP_PREF.pin[g.key]) {
+    if (f.count === need) log('warn', '多源优选已锁定该源，连续失败仍按锁定播放', { group: g.name, channel: ch.name || '', fails: f.count, reason: String(reason || '').slice(0, 80) });
+    return false;
+  }
+  // 优先挑窗口内没失败过的源，全都有失败记录时再按评分挑，避免两个坏源来回弹
+  const ranked = sortGroupMembers(g, ch.id);
+  const fresh = ranked.filter((c) => {
+    const cf = groupFail.get(c.id);
+    return !(cf && cf.count > 0 && now - cf.at < GROUP_FAIL_WINDOW);
+  });
+  const next = fresh[0] || ranked[0];
+  if (!next) return false;
+  const rt = GROUP_RUNTIME.get(g.key) || {};
+  if (rt.currentId === next.id) return false;   // 已经切到它了，不重复切
+  GROUP_RUNTIME.set(g.key, { currentId: next.id, switchedAt: now, from: ch.id, reason: String(reason || '').slice(0, 80) });
+  GROUP_PREF.lastGood[g.key] = next.id;
+  persistGroups();
+  log('warn', '多源自动切换', {
+    group: g.name,
+    from: (ch.name || '') + ' #' + ch.id,
+    to: (next.name || '') + ' #' + next.id,
+    fails: f.count,
+    reason: String(reason || '').slice(0, 120),
+  });
+  return true;
+}
+function noteGroupSuccess(ch) {
+  if (ch) groupFail.delete(ch.id);
+}
+// 该频道是否应被重定向到同组更优的源（目标必须健康，避免来回弹）
+function groupRedirectTarget(ch) {
+  if (!ch || !GROUP_PREF.enabled || !GROUP_PREF.autoFailover) return null;
+  const g = groupOf(ch);
+  if (!isMultiGroup(g)) return null;
+  if (GROUP_PREF.pin[g.key]) return null;
+  const cur = groupCurrent(g);
+  if (!cur || cur.id === ch.id) return null;
+  const q = CHANNEL_CHECK.quality.get(cur.id);
+  if (q && q.state === 'bad') return null;
+  const f = groupFail.get(cur.id);
+  if (f && f.count >= GROUP_THRESHOLD && Date.now() - f.at < GROUP_FAIL_WINDOW) return null;
+  return cur;
+}
+function redirectToGroupPeer(req, res, ch, line) {
+  if (!req || !req._xtePlayEntry) return false;
+  if (res.headersSent) return false;
+  const tgt = groupRedirectTarget(ch);
+  if (!tgt) return false;
+  const loc = '/play/' + encodeURIComponent(tgt.id) + '.m3u8?gsw=1' + (line ? '&line=' + encodeURIComponent(line) : '');
+  log('info', '多源优选切换播放地址', { from: ch.id, to: tgt.id, name: tgt.name || '' });
+  res.writeHead(302, { Location: loc, 'Cache-Control': 'no-cache, no-store', 'Access-Control-Allow-Origin': '*' });
+  res.end();
+  return true;
+}
+// 质量检测跑完后按最新结果重选各组最优源
+function autoPickGroups() {
+  if (!GROUP_PREF.enabled || !GROUP_PREF.dedupe) return 0;
+  let changed = 0;
+  for (const g of channelGroupMap().values()) {
+    if (!isMultiGroup(g)) continue;
+    if (GROUP_PREF.pin[g.key]) continue;
+    const best = sortGroupMembers(g)[0];
+    if (!best) continue;
+    const rt = GROUP_RUNTIME.get(g.key);
+    if (!rt || rt.currentId !== best.id) {
+      GROUP_RUNTIME.set(g.key, { currentId: best.id, switchedAt: Date.now(), from: (rt && rt.currentId) || '', reason: 'quality' });
+      GROUP_PREF.lastGood[g.key] = best.id;
+      changed++;
+    }
+  }
+  if (changed) { persistGroups(); log('info', '多源优选按最新质量重选完成', { groups: changed }); }
+  return changed;
+}
+
+// 给前端的多源组快照
+function groupsSnapshot() {
+  const map = channelGroupMap();
+  const multi = [];
+  for (const g of map.values()) {
+    if (!isMultiGroup(g)) continue;
+    const cur = groupCurrent(g);
+    const rt = GROUP_RUNTIME.get(g.key) || {};
+    const members = g.members.map((c) => {
+      const q = CHANNEL_CHECK.quality.get(c.id);
+      const src = sources.find((s) => s.id === c.sourceId);
+      const f = groupFail.get(c.id);
+      return {
+        id: c.id,
+        name: c.name || c.url,
+        url: c.url,
+        state: q ? q.state : 'unknown',
+        reason: q ? (q.reason || '') : '未检测',
+        kbps: (q && q.kbps) || 0,
+        ms: (q && q.ms) || 0,
+        source: src ? src.name : '',
+        enabled: c.enabled !== false,
+        current: !!cur && cur.id === c.id,
+        pinned: GROUP_PREF.pin[g.key] === c.id,
+        fails: (f && f.count) || 0,
+      };
+    }).sort((a, b) => (b.current - a.current) || (b.kbps - a.kbps));
+    multi.push({
+      key: g.key,
+      name: g.name,
+      count: g.members.length,
+      currentId: cur ? cur.id : '',
+      current: cur ? (cur.name || cur.url) : '',
+      switchedAt: rt.switchedAt || 0,
+      reason: rt.reason || '',
+      pinned: !!GROUP_PREF.pin[g.key],
+      members,
+    });
+  }
+  multi.sort((a, b) => (b.count - a.count) || String(a.name).localeCompare(String(b.name), 'zh'));
+  return Object.assign(groupsSummary(), { count: multi.length, groups: multi });
+}
+
 function channelCheckStatus() {
   const st = {
     running: CHANNEL_CHECK.running,
@@ -2438,7 +2713,7 @@ function probeFailReason(e) {
 
 async function probeChannel(ch) {
   const t0 = Date.now();
-  const UA = { 'User-Agent': 'Mozilla/5.0 (XTE-IPTV/5.2.3; +quality-check)' };
+  const UA = { 'User-Agent': 'Mozilla/5.0 (XTE-IPTV/5.2.4; +quality-check)' };
   const out = { state: 'bad', reason: '', ms: 0, segMs: 0, bytes: 0, kbps: 0, kind: 'hls' };
   const fail = (reason) => { out.state = 'bad'; out.reason = reason; out.ms = Date.now() - t0; return out; };
   const headerInt = (headers, name) => {
@@ -2467,8 +2742,22 @@ async function probeChannel(ch) {
       }
       return fail('不是有效的 HLS 播放列表');
     }
+    // v5.2.4：主清单（#EXT-X-STREAM-INF）本身不含分片，必须跟进子清单才算真测过。
+    // 否则「主清单能打开、子清单全挂」的源会被误判为优秀，多源优选就总挑到它。
+    let plText = text;
+    let plUrl = ch.url;
+    for (let hop = 0; hop < 2; hop++) {
+      if (!/#EXT-X-STREAM-INF/i.test(plText)) break;
+      const variant = firstVariantUri(plText, plUrl);
+      if (!variant || variant === plUrl) { plText = ''; break; }
+      const vb = await fetchText(variant, UA, 8000);
+      plText = vb.toString('utf8');
+      plUrl = variant;
+    }
+    if (!plText) return fail('主清单没有可用的子清单（子地址缺失或指向自身）');
+    if (!isHlsPlaylistText(plText)) return fail('子播放列表无效（可能需登录或已下线）');
     const plMs = Date.now() - t0;
-    const pl = parseMediaPlaylist(text, ch.url);
+    const pl = parseMediaPlaylist(plText, plUrl);
     const seg = pl.segs[0];
     if (!seg) {
       out.ms = plMs;
@@ -2476,7 +2765,7 @@ async function probeChannel(ch) {
       out.reason = '播放列表暂无可播分片（直播窗口为空）';
       return out;
     }
-    const mDur = text.match(/#EXTINF:\s*([\d.]+)/);
+    const mDur = plText.match(/#EXTINF:\s*([\d.]+)/);
     const dur = mDur ? Number(mDur[1]) : 0;
     const t1 = Date.now();
     const r2 = await fetchUpstream(seg, { headers: Object.assign({ Range: 'bytes=0-2047' }, UA), timeoutMs: 8000 });
@@ -2549,6 +2838,7 @@ function startChannelCheck(targets, disableBad) {
     CHANNEL_CHECK.running = false;
     CHANNEL_CHECK.finishedAt = Date.now();
     persistCheckResult();
+    autoPickGroups();   // v5.2.4：检测完按最新质量重选各组最优源
     let disabled = 0;
     if (CHANNEL_CHECK.disableBad && CHANNEL_CHECK.bad.length) {
       const badIds = new Set(CHANNEL_CHECK.bad.map((b) => b.id));
@@ -2659,7 +2949,60 @@ async function handleApi(req, res, parsed) {
         maxConcurrent: DOWNLOAD_SCHED.maxConcurrent,
         globalKbps: DOWNLOAD_SCHED.kbps(),
       },
+      groups: groupsSummary(),
     });
+  }
+
+  // 多源优选：GET 看所有「同名多源」组与当前选中的源
+  if (p === '/api/groups' && method === 'GET') {
+    return sendJson(res, 200, groupsSnapshot());
+  }
+  // 多源优选：POST 开关 / 锁定某个源 / 解除锁定 / 重新挑选
+  if (p === '/api/groups' && method === 'POST') {
+    const body = JSON.parse(await readBody(req));
+    const map = channelGroupMap();
+    let touched = 0;
+    if (body.enabled !== undefined) GROUP_PREF.enabled = !!body.enabled;
+    if (body.dedupe !== undefined) GROUP_PREF.dedupe = !!body.dedupe;
+    if (body.autoFailover !== undefined) GROUP_PREF.autoFailover = !!body.autoFailover;
+    if (body.pin && body.pin.key) {
+      const key = String(body.pin.key);
+      const id = String(body.pin.id || '');
+      const g = map.get(key);
+      if (!g) return sendJson(res, 404, { error: '分组不存在' });
+      if (id) {
+        if (!g.members.some((c) => c.id === id)) return sendJson(res, 400, { error: '该频道不在此分组内' });
+        GROUP_PREF.pin[key] = id;
+        GROUP_RUNTIME.delete(key);
+        log('info', '多源优选已锁定源', { group: g.name, channelId: id });
+      } else {
+        delete GROUP_PREF.pin[key];
+        log('info', '多源优选已取消锁定', { group: g.name });
+      }
+      touched++;
+    }
+    if (body.unpin && body.unpin.key) {
+      delete GROUP_PREF.pin[String(body.unpin.key)];
+      GROUP_RUNTIME.delete(String(body.unpin.key));
+      touched++;
+    }
+    if (body.repick && body.repick.key) {
+      const key = String(body.repick.key);
+      const g = map.get(key);
+      if (!g) return sendJson(res, 404, { error: '分组不存在' });
+      delete GROUP_PREF.pin[key];
+      GROUP_RUNTIME.delete(key);
+      const best = sortGroupMembers(g)[0];
+      if (best) { GROUP_RUNTIME.set(key, { currentId: best.id, switchedAt: Date.now(), reason: 'manual-repick' }); GROUP_PREF.lastGood[key] = best.id; }
+      touched++;
+    }
+    if (body.repickAll) {
+      for (const key of Object.keys(GROUP_PREF.pin)) delete GROUP_PREF.pin[key];
+      GROUP_RUNTIME.clear();
+      touched += autoPickGroups();
+    }
+    persistGroups();
+    return sendJson(res, 200, Object.assign({ ok: true, touched }, groupsSummary()));
   }
 
   // 会话列表
@@ -2889,6 +3232,7 @@ async function handleApi(req, res, parsed) {
         if (delIds.has(channels[i].id)) channels.splice(i, 1);
       }
       for (const id of delIds) CHANNEL_CHECK.quality.delete(id);
+      invalidateGroups();
       if (!CHANNEL_CHECK.running) { recountQuality(); persistCheckResult(); }
     } else {
       return sendJson(res, 400, { error: 'unknown action' });
@@ -3035,7 +3379,8 @@ function serveMainPlaylist(req, res, parsed) {
   const base = proto + '://' + host;
 
   const out = ['#EXTM3U', '#PLAYLIST:XTE-IPTV'];
-  for (const c of channels) {
+  const allowAll = String(parsed.query.multi || '') === 'all';
+  for (const c of dedupeChannels(channels, allowAll)) {
     if (c.enabled === false) continue;
     const name = c.name || c.tvgName || 'Unknown';
     const attr = [];
@@ -3061,6 +3406,10 @@ async function servePlaylist(req, res, parsed, lineHint) {
   const targetUrl = q.url;
   if (!targetUrl) return sendJson(res, 400, { error: 'missing url' });
   const chan = channels.find((c) => c.url === targetUrl) || null;
+
+  // v5.2.4 多源优选：同一频道有多个源时，当前播的不是组内最优源就直接 302 过去
+  // （只对 /play/<id>.m3u8 入口生效，避免影响 /proxy/m3u8 的嵌套子清单；gsw=1 防循环）
+  if (chan && !q.gsw && redirectToGroupPeer(req, res, chan, lineHint)) return;
 
   // v5.2.1：渐进式媒体（mp4/flv/mkv…）不是 HLS，不能当索引解析，直接把媒体本体透传
   // （保留客户端的 Range 头，播放器可拖动进度）。
@@ -3093,6 +3442,9 @@ async function servePlaylist(req, res, parsed, lineHint) {
       log('warn', '上游未返回 HLS 播放列表，已拒绝输出垃圾清单 session=' + session.id,
         { channel: (chan && chan.name) || '', url: shortKey(targetUrl), brief });
       if (!res.headersSent) {
+        // v5.2.4：这条源坏了，记一次失败；达到阈值就 302 到同组下一个可用源
+        if (chan && noteGroupFailure(chan, '源站未返回 HLS 播放列表', true) &&
+            redirectToGroupPeer(req, res, chan, lineHint)) return;
         res.writeHead(502, {
           'Content-Type': 'text/plain; charset=utf-8',
           'Access-Control-Allow-Origin': '*',
@@ -3116,6 +3468,7 @@ async function servePlaylist(req, res, parsed, lineHint) {
       'Cache-Control': 'no-cache',
     });
     res.end(rewritten);
+    noteGroupSuccess(chan);
     log('info', 'm3u8 索引返回 session=' + session.id,
       { channel: (chan && chan.name) || '', line: session.line || lineHint || '',
         base, host: req.headers.host || '', ip: session.clientIp,
@@ -3129,6 +3482,8 @@ async function servePlaylist(req, res, parsed, lineHint) {
       { channel: (chan && chan.name) || '', type: classifyError(e), error: e.message });
     if (!res.headersSent) {
       if (/^upstream-not-hls/.test(String(e && e.message || ''))) {
+        if (chan && noteGroupFailure(chan, '源站未返回 HLS 播放列表', true) &&
+            redirectToGroupPeer(req, res, chan, lineHint)) return;
         // 上游给的不是播放列表：回 502 + 一行可读原因，播放器会显示「无法播放」而不是乱解析
         res.writeHead(502, {
           'Content-Type': 'text/plain; charset=utf-8',
@@ -3137,6 +3492,9 @@ async function servePlaylist(req, res, parsed, lineHint) {
         });
         res.end('# XTE: 源站未返回 HLS 播放列表\n# ' + String(e.message).slice(0, 200) + '\n');
       } else {
+        // v5.2.4：解析/回源异常也可能只是这条源的问题，先看能否切到同组其它源
+        if (chan && noteGroupFailure(chan, e.message, true) &&
+            redirectToGroupPeer(req, res, chan, lineHint)) return;
         pipeUpstream(targetUrl, req, res, 'm3u8-fallback');
       }
     }
@@ -3238,6 +3596,10 @@ async function serveSegment(req, res, parsed) {
         session.stats.fail++;
         session.noteFailure();
         session.badKeys.add(key);
+        // v5.2.4：分片连续拉不到多半是这条源塌了，计票等下次索引请求自动切源
+        if (session.chan && session.consecutiveFail >= 3) {
+          noteGroupFailure(session.chan, '分片连续失败(' + session.consecutiveFail + ')');
+        }
         log('error', '分片彻底失败，标记坏片并插 discontinuity session=' + session.id,
           { channel: (session.chan && session.chan.name) || '', key: shortKey(key),
             type: classifyError(e2), error: e2.message, costMs: Date.now() - t0,
@@ -3373,10 +3735,12 @@ const server = http.createServer(async (req, res) => {
     if (lineMatch && req.method === 'GET') {
       const kind = lineMatch[1].toLowerCase();
       const bases = getLineBases();
+      // v5.2.4：默认按「同名多源优选」去重，?multi=all 输出全部源
+      const allowAll = String(parsed.query.multi || '') === 'all';
       let text = '';
       if (kind === 'all') {
         if (!config.mergeLines) return sendText(res, 404, 'text/plain; charset=utf-8', '合并列表未启用');
-        text = buildMergedPlaylist(bases, channels);
+        text = buildMergedPlaylist(bases, channels, allowAll);
       } else {
         const base = resolvePlaybackBase(kind, req);
         const bases = getLineBases();
@@ -3384,11 +3748,16 @@ const server = http.createServer(async (req, res) => {
           log('info', '/m3u/' + kind + ' 线路未配置，回退使用请求 Host 生成列表',
             { line: kind, host: req.headers.host || '', ip: clientIp(req) });
         }
-        const item = buildLinePlaylist(base, channels, kind);
+        const item = buildLinePlaylist(base, channels, kind, allowAll);
         if (item.skipped > 0) log('info', '/m3u/' + kind + ' 跳过 ' + item.skipped + ' 个停用频道');
         text = item.text;
       }
-      log('info', '多线路列表请求 /m3u/' + kind, { channels: channels.filter((c) => c.enabled !== false).length });
+      const gsum = groupsSummary();
+      log('info', '多线路列表请求 /m3u/' + kind, {
+        channels: channels.filter((c) => c.enabled !== false).length,
+        multiGroups: gsum.multi, deduped: allowAll ? 0 : gsum.involved - gsum.multi,
+        output: text.split('\n').filter((l) => l && !l.startsWith('#')).length,
+      });
       return sendText(res, 200, 'audio/x-mpegurl; charset=utf-8', text,
         { 'Content-Disposition': `inline; filename="${kind}.m3u8"` });
     }
@@ -3397,7 +3766,7 @@ const server = http.createServer(async (req, res) => {
     if ((p === '/playlist.m3u' || p === '/m3u' || p === '/m3u8' || p === '/m3u/playlist.m3u') && req.method === 'GET') {
       const host = req.headers.host || ('localhost:' + PORT);
       const base = 'http://' + host;
-      const item = buildLinePlaylist(base, channels);
+      const item = buildLinePlaylist(base, channels, '', String(parsed.query.multi || '') === 'all');
       return sendText(res, 200, 'audio/x-mpegurl; charset=utf-8', item.text);
     }
 
@@ -3411,6 +3780,7 @@ const server = http.createServer(async (req, res) => {
       const qLine = parsed.query.line ? String(parsed.query.line).toLowerCase() : '';
       const line = (qLine === 'inner' || qLine === 'ipv6' || qLine === 'frp') ? qLine : detectLine(req);
       req._xteLine = line;
+      req._xtePlayEntry = true;   // v5.2.4：/play 入口允许做多源优选 302
       return await servePlaylist(req, res, parsed, line);
     }
     if (p === '/play' && req.method === 'GET') {
@@ -3421,6 +3791,7 @@ const server = http.createServer(async (req, res) => {
       // 以本次请求的 Host/IP 判定线路并固化到 req，后续分片请求沿用
       const qLine = parsed.query.line ? String(parsed.query.line).toLowerCase() : '';
       req._xteLine = (qLine === 'inner' || qLine === 'ipv6' || qLine === 'frp') ? qLine : detectLine(req);
+      req._xtePlayEntry = true;
       return await servePlaylist(req, res, parsed, req._xteLine);
     }
 

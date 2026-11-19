@@ -2,7 +2,20 @@
 
 > 飞牛 NAS（fnOS）上的 IPTV 直播源统一管理与智能代理。标准 HLS 输出，**无转码、零第三方依赖**，手机 / 平板 / 电视 / 电脑全终端直接看。
 
-[![version](https://img.shields.io/badge/version-5.2.3-blue)]() [![license](https://img.shields.io/badge/license-MIT-green)]() [![runtime](https://img.shields.io/badge/runtime-Node.js-orange)]()
+[![version](https://img.shields.io/badge/version-5.2.4-blue)]() [![license](https://img.shields.io/badge/license-MIT-green)]() [![runtime](https://img.shields.io/badge/runtime-Node.js-orange)]()
+
+## v5.2.4 更新（同名多源自动优选 + 故障自动切换）
+
+用户反馈：「同一个频道有好几个源，能不能自动切换质量最优的源」。本版把「同名多源」聚合起来统一调度：
+
+| 能力 | 说明 |
+|---|---|
+| **同名聚合** | 频道名归一化后相同的自动归为一组（`CCTV1` / `CCTV1高清` / `CCTV-1` 视为同一频道；`北京卫视4K` 与 `北京卫视` 同组），实测现网 876 个频道归并成 119 组多源频道 |
+| **列表去重** | 播放列表每个多源频道只输出**当前最优**的一条，实测 876 → 572 个频道；每组每条线路都保留（内网/IPv6/FRP 不受影响）；加 `?multi=all` 可关闭去重、导出全部源 |
+| **优选打分** | 先看质量检测结果（优秀 > 一般 > 未检测 > 失效），再比码率与响应速度，并排除近期失败过的源 |
+| **故障自动切换** | 播放失败（源站连不上、返回网页、不是 HLS、分片连续失败）时自动切到同组下一个可用源，并 `302` 到新地址，播放器侧无感；连续失败才切，避免两源互跳 |
+| **手动锁定** | 频道管理页「多源优选」面板可看每个频道各源的质量，下拉即可锁定某个源（锁定后不自动切换），也可点「自动」交回系统 |
+| **检测联动** | 每次质量检测跑完，自动按最新结果重新优选全部多源频道 |
 
 ## v5.2.3 更新（检测源质量 + 失效频道可删除）
 
@@ -81,7 +94,7 @@ RSS 超 `memSoftLimitMB`(700) 清空闲缓存与停滞回源；超 `memHardLimit
 
 ### 飞牛 fnOS
 
-1. 下载最新版 `xte-5.2.1-x86_64.fpk`（x86_64 NAS）或 `xte-5.2.1-aarch64.fpk`（ARM NAS），见 [Releases](../../releases)，仓库 `dist/` 目录里也有同名文件。
+1. 下载最新版 `xte-5.2.4-x86_64.fpk`（x86_64 NAS）或 `xte-5.2.4-aarch64.fpk`（ARM NAS），见 [Releases](../../releases)，仓库 `dist/` 目录里也有同名文件。
 2. 打开 fnOS「应用中心」→ 右上角「手动安装」→ 选择 fpk 文件。
 3. 安装完成后打开 XTE，在「源管理」里添加你的 IPTV 订阅地址或上传 m3u 文件。
 4. 把播放地址（`http://<NAS内网IP>:34500/m3u/inner.m3u8`）填进任意支持 HLS 的播放器即可观看。

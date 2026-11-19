@@ -1,8 +1,32 @@
-# XTE-IPTV 直播代理 (FPK) v5.2.3
+# XTE-IPTV 直播代理 (FPK) v5.2.4
 
 ## 项目概览
 飞牛 NAS 上的 IPTV 直播代理服务。输出标准 HLS (m3u8 + TS)，无转码。
-- **v5.2.3（当前）：检测源质量（三级）+ 失效频道可删除（墓碑屏蔽名单）**
+- **v5.2.4（当前）：同名多源自动优选 + 故障自动切换**
+  - **需求**：用户「同一个频道有好几个源，能不能自动切换质量最优的源」。现网 876 频道里 423 个
+    属于同名多源（119 组），此前平铺在播放列表里，用户只能自己试。
+  - **① 分组** `groupKeyOf(ch)` = `n:` + `normChannelName(name)`（全角转半角、去括号、剥
+    超高清/高清/标清/4K/HD/UHD/线路N 后缀、去标点空白、小写）→ 垃圾名回落 `id:` + 归一 tvgId →
+    `u:` + url 不聚合。`channelGroupMap()` 以「频道数组身份 + 长度 + GROUP_GEN」为缓存键，
+    `invalidateGroups()` 在源刷新/批量删除后调用。
+  - **② 打分** `groupMemberScore()`：近期失败（120s）升序 → 质量 good3/fair2/unknown1.5/bad0 降序 →
+    kbps 降序 → ms 升序 → 原始顺序（`sortGroupMembers(g, excludeId)`）。
+  - **③ 去重** `dedupeChannels(list, allowAll)` 接入 `buildLinePlaylist`/`buildMergedPlaylist`/
+    `serveMainPlaylist`；`?multi=all` 关闭。实测 876 → 572（CCTV1 3→1）。
+  - **④ 切换** `noteGroupFailure(ch, reason, immediate)`：3 分钟窗口内 2 次（immediate=1 次）切换，
+    优先挑窗口内无失败记录的源；`GROUP_RUNTIME` 记 currentId，`GROUP_PREF.lastGood` 落盘。
+    切换后 `redirectToGroupPeer()` 302 到 `/play/<newId>.m3u8?gsw=1`（`gsw=1` 防循环），
+    只有 `/play` 入口（`req._xtePlayEntry`）会 302，`/proxy/m3u8` 嵌套清单不参与；pin 的源不自动切。
+    触发点：上游非 HLS、回源/解析异常、`serveSegment` 分片连续失败≥3、`/play` 请求非当前源。
+  - **⑤ 探测补强** `probeChannel()` 现在跟进主清单（`#EXT-X-STREAM-INF`，`firstVariantUri()`）最多 2 跳
+    再探分片 —— 否则「主清单能开、子清单全挂」的源会被误判优秀，优选总挑它。
+  - **⑥ 检测联动** `autoPickGroups()` 在 `startChannelCheck` 完成后重选全部未锁定组。
+  - **⑦ API** `GET /api/groups`（组 + 各源质量 + 当前选中）、`POST /api/groups`（开关/pin/unpin/
+    repick/repickAll），持久化 `DATA_DIR/groups.json`；`/api/status` 增 `groups:{multi,involved,output}`。
+  - **⑧ 前端** 频道管理页「多源优选」面板（三开关 + 组表 + 下拉锁定 + 自动按钮）+ 频道行「N源」徽标。
+  - **实测**：119 组 / 423 源条目，列表 876→572；全量检测 59s（优秀 769 / 一般 12 / 失效 95）；
+    死源一次失败即 302 切换；CCTV1 播放 `h264 1920x1080 + aac` 无回归。
+- **v5.2.3（上一版）：检测源质量（三级）+ 失效频道可删除（墓碑屏蔽名单）**
   - **需求**：用户「优化检测源质量的功能，失效的源加入删除功能」。旧实现两个缺口：①探测只产出 true/false，
     用户既不知道「为什么不可用」，也看不到「能播但很卡的弱源」；②失效频道只能停用，手动删掉后
     `refreshSource()` 30 分钟自动刷新会按源原样重建 —— **删除等于没删**（无墓碑机制）。

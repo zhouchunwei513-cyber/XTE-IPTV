@@ -1,5 +1,53 @@
 # 更新日志
 
+## v5.2.4 (2026-11-19) — 同名多源自动优选 + 故障自动切换
+
+用户反馈：「同一个频道有好几个源，能不能自动切换质量最优的源」。现网 876 个频道里有 423 个
+属于同名多源（119 组），此前这些源在播放列表里是平铺的，用户只能自己一个个试。
+
+### 后端
+
+- **分组** `groupKeyOf(ch)`：频道名归一化（`normChannelName()`：全角转半角、去括号、剥
+  `超高清/高清/标清/4K/HD/UHD/线路N…` 等后缀、去标点空白）后作为组键；名称是「未知频道/频道NNN」
+  这类垃圾名时退回 `tvg-id`，仍无则按 URL 单独成组（不聚合）。缓存按频道数组身份 + 长度失效。
+- **优选打分** `groupMemberScore()`：近期失败次数（120s 内）升序 → 质量（`good=3 / fair=2 /
+  unknown=1.5 / bad=0`）降序 → 码率降序 → 耗时升序 → 原始顺序，`sortGroupMembers()` 用于选源与展示。
+- **列表去重** `dedupeChannels()`：`buildLinePlaylist` / `buildMergedPlaylist` / `serveMainPlaylist`
+  统一走它，每个多源组只输出当前选中源；`?multi=all` 关闭去重。`/api/status` 增加
+  `groups:{multi,involved,output}`。
+- **故障切换** `noteGroupFailure(ch, reason, immediate)` / `noteGroupSuccess(ch)`：
+  - 触发点：`servePlaylist` 上游非 HLS（502 分支，immediate）、回源/解析异常（catch 分支，immediate）、
+    `serveSegment` 分片连续失败 ≥3 次、`/play` 入口非当前源；
+  - 3 分钟窗口内失败 2 次（immediate 时 1 次）即切换，**优先挑窗口内没失败过的源**，避免两个坏源互跳；
+  - 切换后 `302` 到 `/play/<newId>.m3u8?gsw=1`（`gsw=1` 防循环），播放器侧无感；
+  - 已锁定（pin）的源不自动切换，只记日志「已锁定该源，连续失败仍按锁定播放」。
+- **优选入口重定向** `groupRedirectTarget()` / `redirectToGroupPeer()`：只有 `/play/<id>.m3u8`
+  入口会 302（`req._xtePlayEntry`），`/proxy/m3u8` 嵌套子清单不参与，目标必须不是 `bad`
+  且近期没连续失败。实测：请求同组非当前源 → 302 到当前源；把当前源 URL 改成死地址 →
+  一次失败即切到同组另一源并 302。
+- **检测联动** `autoPickGroups()`：`startChannelCheck` 完成后按最新质量重选各组当前源（跳过锁定组）。
+- **质量探测补强** `probeChannel()` 现在会跟进主播放列表（`#EXT-X-STREAM-INF`）到子清单再探测，
+  最多 2 跳；否则「主清单能打开、子清单全挂」的源会被误判为优秀，多源优选就会总挑到它。
+- **API**：`GET /api/groups` 返回全部多源组与当前选中的源（含各源质量/码率/失败次数）；
+  `POST /api/groups` 支持 `{enabled|dedupe|autoFailover}`、`{pin:{key,id}}`、`{unpin:{key}}`、
+  `{repick:{key}}`、`{repickAll:true}`。配置持久化到 `DATA_DIR/groups.json`。
+
+### 前端
+
+- 频道管理页新增「多源优选」面板：三个开关（启用 / 列表去重 / 自动切源）、组数汇总、
+  每组一行（频道 / 源数 / 当前源下拉 / 状态徽标 / 「自动」按钮），组多时可「显示全部」。
+- 频道列表名称后新增「N源」徽标，悬浮提示「同名多源 N 个，播放时自动选最优并支持故障切换」。
+
+### 实测（现网数据副本，876 频道）
+
+- 聚合：119 组同名多源（423 个源条目），播放列表 876 → **572** 条（`CCTV1` 3 条 → 1 条）。
+- 全量质量检测 59s：优秀 769 / 一般 12 / 失效 95；检测完自动重选 119 组。
+- 故障切换：把「大湾区卫视」当前源改成死地址 → 首次请求即 `302` 到同组另一源，日志
+  `多源自动切换 {"fails":1,"reason":"connect ECONNREFUSED"}`。
+- 主清单跟进修复后，此前被误判为「优秀」的自指主清单源（`4ca0cbacb44d602b`）正确判为
+  「子播放列表无效」。
+- CCTV1 经去重列表播放 `h264 1920x1080 + aac` 无回归。
+
 ## v5.2.3 (2026-11-19) — 检测源质量 + 失效频道可删除
 
 用户需求：「优化检测源质量的功能，失效的源加入删除功能」。原实现的两个缺口：

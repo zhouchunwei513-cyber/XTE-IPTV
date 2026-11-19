@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>XTE-IPTV 直播代理 v5.2.3</title>
+<title>XTE-IPTV 直播代理 v5.2.4</title>
 <style>
   :root{
     --bg:#0e1116; --panel:#161b22; --panel2:#1c232d; --border:#2a323d;
@@ -123,7 +123,7 @@
 <body>
 <div class="app">
   <aside class="side">
-    <div class="logo">XTE-IPTV<small>直播代理 v5.2.3</small></div>
+    <div class="logo">XTE-IPTV<small>直播代理 v5.2.4</small></div>
     <nav class="nav">
       <a data-tab="dash" class="active">仪表盘</a>
       <a data-tab="sources">源管理</a>
@@ -131,7 +131,7 @@
       <a data-tab="settings">系统设置</a>
       <a data-tab="logs">运行日志</a>
     </nav>
-    <div class="ver" id="ver">v5.2.3</div>
+    <div class="ver" id="ver">v5.2.4</div>
   </aside>
 
   <main class="main">
@@ -247,6 +247,30 @@
         <span style="flex:1"></span>
         <button class="sm" onclick="showExportMenu(event,'selected')" title="导出勾选的频道">导出选中 ▾</button>
         <button class="ghost sm" onclick="showExportMenu(event,'all')" title="导出当前筛选结果（有搜索词则为搜索结果，否则全部启用频道），可选择导出地址方式">导出 ▾</button>
+      </div>
+      <div class="panel" id="groupPanel">
+        <h2 style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">多源优选
+          <button class="ghost sm" onclick="repickAllGroups()" title="按最新质量检测结果重新挑选每个频道的最佳源（会解除手动锁定）">重新优选全部</button>
+          <span style="flex:1"></span>
+          <label class="check" style="display:flex;align-items:center;gap:6px;margin:0;cursor:pointer" title="关闭后所有源都出现在播放列表里（同频道会出现多条）">
+            <input type="checkbox" id="grpEnabled" onchange="toggleGroups('enabled', this.checked)"> <span>启用</span>
+          </label>
+          <label class="check" style="display:flex;align-items:center;gap:6px;margin:0;cursor:pointer" title="同一频道只输出当前最优的一条">
+            <input type="checkbox" id="grpDedupe" onchange="toggleGroups('dedupe', this.checked)"> <span>列表去重</span>
+          </label>
+          <label class="check" style="display:flex;align-items:center;gap:6px;margin:0;cursor:pointer" title="播放失败时自动切到组内其它源">
+            <input type="checkbox" id="grpFailover" onchange="toggleGroups('autoFailover', this.checked)"> <span>自动切源</span>
+          </label>
+        </h2>
+        <p class="desc">同一个频道在多个源里都有时，播放列表只输出<b>当前最优</b>的那一条（先看质量检测结果，再看码率与响应速度）；
+          播放失败会自动切到同组其它源，播放器不用重连。锁定某个源之后不再自动切换。</p>
+        <div class="muted" id="grpBar" style="margin-bottom:8px"></div>
+        <div style="max-height:360px;overflow:auto">
+          <table>
+            <thead><tr><th>频道</th><th style="width:64px">源数</th><th>当前源（可手动锁定）</th><th style="width:72px">状态</th><th style="width:64px">操作</th></tr></thead>
+            <tbody id="grpBody"></tbody>
+          </table>
+        </div>
       </div>
       <div class="panel" style="padding:0">
         <table>
@@ -775,9 +799,84 @@ function renderQualitySummary() {
     '：<b>优秀 ' + (qualityStats.ok || 0) + '</b> · 一般 ' + (qualityStats.fairCount || 0) +
     ' · <b style="color:var(--err)">失效 ' + (qualityStats.badCount || 0) + '</b>';
 }
+// ---- 多源优选（v5.2.4）----
+let groupData = null;
+let groupCount = {};           // channelId -> 同组源数
+let grpShowAll = false;
+function stateBadgeHtml(st) {
+  if (st === 'good') return '<span class="badge direct">优秀</span>';
+  if (st === 'fair') return '<span class="badge warn">一般</span>';
+  if (st === 'bad') return '<span class="badge err">失效</span>';
+  return '<span class="muted">未检测</span>';
+}
+async function loadGroups(force) {
+  if (!force && groupData && Date.now() - (groupData._at || 0) < 5000) return;
+  try {
+    const d = await (await fetch('/api/groups')).json();
+    d._at = Date.now();
+    groupData = d;
+    groupCount = {};
+    for (const g of d.groups || []) for (const m of g.members) groupCount[m.id] = g.count;
+  } catch { return; }
+  renderGroups();
+}
+function renderGroups() {
+  if (!groupData) return;
+  const g = groupData;
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.checked = !!v; };
+  set('grpEnabled', g.enabled); set('grpDedupe', g.dedupe); set('grpFailover', g.autoFailover);
+  const bar = document.getElementById('grpBar');
+  if (bar) {
+    bar.innerHTML = '共 <b>' + g.multi + '</b> 组同名多源频道（涉及 ' + g.involved + ' 个源条目）' +
+      '，播放列表去重后输出 <b>' + g.output + '</b> 个频道' + (g.dedupe ? '' : '（列表去重已关闭）') +
+      ' · <a href="#" onclick="loadGroups(true);return false;">刷新</a>';
+  }
+  const body = document.getElementById('grpBody');
+  if (!body) return;
+  if (!g.groups || !g.groups.length) {
+    body.innerHTML = '<tr><td colspan="5" class="muted" style="text-align:center;padding:16px">没有同名多源频道</td></tr>';
+    return;
+  }
+  const list = grpShowAll ? g.groups : g.groups.slice(0, 40);
+  body.innerHTML = list.map((x) => {
+    const opts = x.members.map((m) => {
+      const tag = (m.state === 'good' ? '✔ ' : m.state === 'bad' ? '✘ ' : '') + (m.name || '') +
+        (m.kbps ? ' · ' + m.kbps + 'kbps' : '') + (m.source ? ' · ' + m.source : '');
+      return '<option value="' + esc(m.id) + '"' + (m.current ? ' selected' : '') + '>' + esc(tag) + '</option>';
+    }).join('');
+    const cur = x.members.find((m) => m.current) || {};
+    return '<tr><td><b>' + esc(x.name) + '</b>' +
+      (x.pinned ? ' <span class="badge warn" title="已锁定该源，不自动切换">锁定</span>' : '') + '</td>' +
+      '<td>' + x.count + '</td>' +
+      '<td><select onchange="pinGroup(\'' + esc(x.key) + '\', this.value)">' + opts + '</select></td>' +
+      '<td>' + stateBadgeHtml(cur.state) + '</td>' +
+      '<td><button class="ghost sm" onclick="repickGroup(\'' + esc(x.key) + '\')" title="解除锁定并按质量重选">自动</button></td></tr>';
+  }).join('') + (!grpShowAll && g.groups.length > 40
+    ? '<tr><td colspan="5" style="text-align:center"><button class="ghost sm" onclick="grpShowAll=true;renderGroups()">显示全部 ' + g.groups.length + ' 组</button></td></tr>'
+    : '');
+}
+async function postGroups(body) {
+  let d = {};
+  try {
+    const r = await fetch('/api/groups', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    d = await r.json();
+    if (!r.ok) return alert(d.error || '操作失败');
+  } catch (e) { return alert('操作失败：' + e.message); }
+  await loadGroups(true);
+  await loadChannels();
+}
+function toggleGroups(k, v) { postGroups({ [k]: v }); }
+function pinGroup(key, id) { postGroups({ pin: { key: key, id: id } }); }
+function repickGroup(key) { postGroups({ repick: { key: key } }); }
+function repickAllGroups() {
+  if (!confirm('按最新质量结果重新挑选所有多源频道的最佳源？会解除手动锁定。')) return;
+  postGroups({ repickAll: true });
+}
+
 async function loadChannels() {
   const q = document.getElementById('chSearch').value;
   await loadQuality();
+  await loadGroups();
   const data = await API.channels(q);
   allChannels = data.items;
   document.getElementById('chCount').textContent = `共 ${data.total} 个频道`;
@@ -794,7 +893,7 @@ async function loadChannels() {
   body.innerHTML = rows.map(c => `<tr${c.enabled === false ? ' style="opacity:.5"' : ''}>
     <td><input type="checkbox" class="ch-cb" data-id="${esc(c.id)}" onchange="updateSelCount();syncHeadCheck()"></td>
     <td>${c.logo ? `<img class="logo-img" src="${esc(c.logo)}" referrerpolicy="no-referrer" onerror="this.outerHTML='<span class=\\'logo-ph\\'>📺</span>'">` : `<span class="logo-ph">📺</span>`}</td>
-    <td><div class="chan-name"><span><b>${esc(c.name)}</b>${c.enabled === false ? ' <span class="badge warn">已停用</span>' : ''}</span></div></td>
+    <td><div class="chan-name"><span><b>${esc(c.name)}</b>${c.enabled === false ? ' <span class="badge warn">已停用</span>' : ''}${groupCount[c.id] > 1 ? ` <span class="badge cache" title="同名多源 ${groupCount[c.id]} 个，播放时自动选最优并支持故障切换">${groupCount[c.id]}源</span>` : ''}</span></div></td>
     <td class="grp">${esc(c.group || '-')}</td>
     <td class="muted">${esc(c.tvgId || '-')}</td>
     <td>${qualityBadge(c.id)}</td>
