@@ -42,7 +42,7 @@ function toAsciiHost(input) {
   return s;
 }
 
-const APP_VERSION = '5.2.2';
+const APP_VERSION = '5.2.3';
 
 // ---------------------------------------------------------------------------
 // 路径与配置
@@ -63,6 +63,9 @@ const PORT = parseInt(
 const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 const CHANNELS_FILE = path.join(DATA_DIR, 'channels.json');
 const SOURCES_FILE = path.join(DATA_DIR, 'sources.json');
+// v5.2.3 质量检测结果（重启后仍能在频道列表里显示质量徽标）+ 已删除频道的屏蔽名单
+const CHECK_FILE = path.join(DATA_DIR, 'check.json');
+const BLOCKED_FILE = path.join(DATA_DIR, 'blocked.json');
 
 const DEFAULT_CONFIG = {
   // v4.1.2 面向 8~12Mbps 高清直播（单分片约 10MB）调优。
@@ -279,6 +282,40 @@ let channels = loadJson(CHANNELS_FILE, []);
 function persistSources() { saveJson(SOURCES_FILE, sources); }
 function persistChannels() { saveJson(CHANNELS_FILE, channels); }
 function persistConfig() { saveJson(CONFIG_FILE, config); }
+
+// ---------------------------------------------------------------------------
+// v5.2.3 已删除频道的「墓碑」名单
+//   问题：频道由源刷新重建，直接删掉 channels.json 里的条目，下一次自动刷新
+//   （默认每 30 分钟）就会把它按源里的原样重新拉回来，「删除失效频道」等于没删。
+//   做法：删除时把原始 url 记进 blocked.json，refreshSource 重建时跳过这些地址。
+//   用户可在「源管理」页恢复（恢复后立即重新解析对应源）。
+// ---------------------------------------------------------------------------
+let blockedChannels = loadJson(BLOCKED_FILE, []);
+if (!Array.isArray(blockedChannels)) blockedChannels = [];
+function persistBlocked() { saveJson(BLOCKED_FILE, blockedChannels); }
+function blockedUrlSet() {
+  const set = new Set();
+  for (const b of blockedChannels) { if (b && b.url) set.add(b.url); }
+  return set;
+}
+function addBlockedChannels(list) {
+  const have = blockedUrlSet();
+  let added = 0;
+  for (const c of list) {
+    const url = String((c && c.url) || '').trim();
+    if (!url || have.has(url)) continue;
+    have.add(url);
+    blockedChannels.push({ url, name: c.name || '', sourceId: c.sourceId || '', at: Date.now() });
+    added++;
+  }
+  // 上限保护：只保留最近 20000 条，避免长年累积把 blocked.json 撑大
+  if (blockedChannels.length > 20000) blockedChannels = blockedChannels.slice(-20000);
+  if (added) {
+    persistBlocked();
+    log('info', '频道加入屏蔽名单（源刷新不再恢复）', { added, total: blockedChannels.length });
+  }
+  return added;
+}
 
 // ---------------------------------------------------------------------------
 // v5.1 管理后台认证（用户名/密码 + 会话 token）
@@ -624,8 +661,9 @@ function fetchUpstream(targetUrl, { headers, timeoutMs, method } = {}) {
   return new Promise((resolve, reject) => {
     let parsed;
     try { parsed = new URL(targetUrl); } catch (e) { return reject(e); }
-    const lib = parsed.protocol === 'https:' ? https : http;
-    const agent = parsed.protocol === 'https:' ? KEEP_AGENT_S : KEEP_AGENT;
+    // lib/agent 必须按「当前这一跳」的协议选，不能按最初的 URL 选：
+    // http→https 的重定向非常常见（运营商源 301 到 https），用 http 模块请求 https 会抛
+    // ERR_INVALID_PROTOCOL（且发生在回调里 → promise 既不 resolve 也不 reject，请求挂到超时）。
     const reqHeaders = Object.assign({
       'User-Agent': 'Mozilla/5.0 (XTE-IPTV/4.0; +native-hls)',
       'Accept': '*/*',
@@ -642,6 +680,8 @@ function fetchUpstream(targetUrl, { headers, timeoutMs, method } = {}) {
       let hostname = u.hostname;
       const isV6 = hostname.includes(':') || /^\[.*\]$/.test(hostname);
       if (isV6) hostname = hostname.replace(/^\[|\]$/g, '');
+      const lib = u.protocol === 'https:' ? https : http;
+      const agent = u.protocol === 'https:' ? KEEP_AGENT_S : KEEP_AGENT;
       const reqOpts = {
         method: method || 'GET',
         protocol: u.protocol,
@@ -669,7 +709,14 @@ function fetchUpstream(targetUrl, { headers, timeoutMs, method } = {}) {
       if (isV6) reqOpts.family = 6;
       else if (forceFamily) reqOpts.family = forceFamily;
       const tConn = Date.now();
-      const req = lib.request(reqOpts, (res) => {
+      let req;
+      try {
+        req = lib.request(reqOpts, onResponse);
+      } catch (e) {
+        // 同步抛错（协议不匹配、非法 header 等）必须转成 reject，不能让它冒泡成 uncaughtException
+        return reject(e);
+      }
+      function onResponse(res) {
         const connectMs = Date.now() - tConn; // 建连+首字节到达的总等待（TTFB 近似）
         const status = res.statusCode;
         if (status >= 300 && status < 400 && res.headers.location && redirsLeft > 0) {
@@ -683,7 +730,7 @@ function fetchUpstream(targetUrl, { headers, timeoutMs, method } = {}) {
             contentType: res.headers['content-type'] || '', contentLength: res.headers['content-length'] || '' });
         }
         resolve({ res, status, headers: res.headers, url: urlStr, connectMs });
-      });
+      }
       req.on('timeout', () => {
         netLog('warn', '回源请求超时', { host: hostLabel(u), timeoutMs: timeoutMs || 10000 }, true);
         req.destroy(new Error('upstream timeout'));
@@ -740,24 +787,51 @@ function pipeUpstream(targetUrl, req, res, extraLog, onBytes) {
 
 // 整页拉取（用于 m3u8 解析）；自动处理 gzip/deflate/br 压缩
 function fetchText(url, headers, timeoutMs) {
-  return fetchUpstream(url, { headers, timeoutMs: timeoutMs || 10000 }).then(({ res, status }) => {
+  // v5.2.3：整页读取必须有「硬总时长 + 体积上限」。
+  //   旧实现只靠 socket 空闲超时，遇到「隔几秒吐几个字节、永不结束」的网页/伪 m3u8 会永久挂住，
+  //   频道质量检测会因此整批卡死（实测 716/1230 后 8 个 worker 全部僵死）。
+  const idleMs = timeoutMs || 10000;
+  const deadlineMs = Math.max(6000, idleMs * 2);
+  const maxBytes = 8 * 1024 * 1024;
+  return fetchUpstream(url, { headers, timeoutMs: idleMs }).then(({ res, status }) => {
     return new Promise((resolve, reject) => {
+      let done = false;
+      let bytes = 0;
       const chunks = [];
+      const finish = (fn, v) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        fn(v);
+      };
+      const timer = setTimeout(() => {
+        try { res.destroy(new Error('fetch-text-deadline')); } catch {}
+        finish(reject, new Error('读取响应超时（' + Math.round(deadlineMs / 1000) + 's）'));
+      }, deadlineMs);
       let stream = res;
       const enc = (res.headers['content-encoding'] || '').toLowerCase();
       if (enc === 'gzip') stream = res.pipe(zlib.createGunzip());
       else if (enc === 'deflate') stream = res.pipe(zlib.createInflate());
       else if (enc === 'br') stream = res.pipe(zlib.createBrotliDecompress());
-      stream.on('data', (c) => chunks.push(c));
+      stream.on('data', (c) => {
+        bytes += c.length;
+        if (bytes > maxBytes) {
+          try { res.destroy(); } catch {}
+          return finish(reject, new Error('响应体过大（超过 ' + Math.round(maxBytes / 1048576) + 'MB）'));
+        }
+        chunks.push(c);
+      });
       stream.on('end', () => {
         const buf = Buffer.concat(chunks);
         if (status < 200 || status >= 300) {
-          return reject(new Error('upstream status ' + status));
+          return finish(reject, new Error('upstream status ' + status));
         }
-        resolve(buf);
+        finish(resolve, buf);
       });
-      stream.on('error', reject);
-      res.on('error', reject);
+      stream.on('error', (e) => finish(reject, e));
+      res.on('error', (e) => finish(reject, e));
+      res.on('aborted', () => finish(reject, new Error('上游中断（aborted）')));
+      res.on('close', () => { if (!done) finish(reject, new Error('上游连接已关闭')); });
     });
   });
 }
@@ -2121,7 +2195,11 @@ async function refreshSource(src) {
       });
       text = buf.toString('utf8');
     }
-    const segs = parseM3U(text);
+    const parsedSegs = parseM3U(text);
+    // v5.2.3：跳过用户已删除（屏蔽）的地址，避免刷新后「死频道又回来了」
+    const blockedSet = blockedUrlSet();
+    const segs = blockedSet.size ? parsedSegs.filter((s) => !blockedSet.has(String(s.url || '').trim())) : parsedSegs;
+    const skippedByBlock = parsedSegs.length - segs.length;
     const newChannels = segs.map((seg, i) => ({
       id: crypto.createHash('sha1')
         .update(src.id + '|' + seg.url + '|' + i).digest('hex').slice(0, 16),
@@ -2169,8 +2247,8 @@ async function refreshSource(src) {
     persistSources();
     persistChannels();
     log('info', '源刷新完成 ' + src.name,
-      { count: newChannels.length, costMs: Date.now() - startedAt });
-    return { count: newChannels.length };
+      { count: newChannels.length, skippedByBlock, costMs: Date.now() - startedAt });
+    return { count: newChannels.length, skippedByBlock };
   } catch (e) {
     src.error = humanizeSourceError(e, src.url);
     src.lastRefreshAt = Date.now();
@@ -2243,52 +2321,187 @@ function urlParse(reqUrl) {
 }
 
 // ---------------------------------------------------------------------------
-// v5.2.1 频道可用性检测（后台任务 + 进度轮询）
-//   背景：一份几百上千条的直播源里，常见「上游已下线 / 需登录 / 防盗链」的死频道。
-//   电视上点到死频道就是转圈，因此提供一次性探测，把不可用的批量停用。
-//   判定：先取播放列表（必须是真 HLS 或渐进式媒体），再试拉第一个分片前 2KB。
+// v5.2.3 频道质量检测（后台任务 + 进度轮询）
+//   背景：一份几百上千条的直播源里，常见「上游已下线 / 需登录 / 防盗链」的死频道，
+//   也有「能出画但慢得要命」的弱源。电视上点到死频道就是转圈，点到弱源就是一直卡。
+//   判定分三级（v5.2.3 起不再只有「可用/不可用」）：
+//     good 优秀：播放列表与首个分片都在 3s 内返回，分片体积正常
+//     fair 一般：能播，但响应偏慢 / 分片过小 / 直播窗口暂时为空
+//     bad  失效：取不到播放列表、返回错误页、首片 4xx/5xx、连接被重置等（附原因）
+//   流程：先取播放列表（必须是真 HLS 或渐进式媒体），再试拉第一个分片前 2KB；
+//   结果写入 check.json，重启后频道列表仍能显示质量徽标。
 // ---------------------------------------------------------------------------
 const CHANNEL_CHECK = {
-  running: false, total: 0, done: 0, ok: 0, bad: [], startedAt: 0, finishedAt: 0,
-  disableBad: false, concurrency: 6, aborted: false,
+  running: false, total: 0, done: 0, ok: 0, fair: 0, bad: [], startedAt: 0, finishedAt: 0,
+  disableBad: false, concurrency: 8, aborted: false,
+  quality: new Map(),   // id -> { state, reason, ms, segMs, bytes, kbps, kind, at }
+  qualityAt: 0,
 };
 
+// 启动时恢复上一次的检测结果（只用于展示，不影响播放）
+(function restoreLastCheck() {
+  const saved = loadJson(CHECK_FILE, null);
+  if (saved && Array.isArray(saved.results)) {
+    for (const row of saved.results) {
+      if (Array.isArray(row) && row[0] && row[1]) CHANNEL_CHECK.quality.set(row[0], row[1]);
+    }
+    CHANNEL_CHECK.qualityAt = Number(saved.at) || 0;
+    recountQuality();
+    log('info', '已载入上次质量检测结果', {
+      channels: CHANNEL_CHECK.quality.size, at: CHANNEL_CHECK.qualityAt,
+      good: CHANNEL_CHECK.ok, fair: CHANNEL_CHECK.fair, bad: CHANNEL_CHECK.bad.length,
+    });
+  }
+})();
+
+function persistCheckResult() {
+  CHANNEL_CHECK.qualityAt = CHANNEL_CHECK.finishedAt || Date.now();
+  try {
+    saveJson(CHECK_FILE, { at: CHANNEL_CHECK.qualityAt, results: [...CHANNEL_CHECK.quality.entries()].slice(0, 8000) });
+  } catch {}
+}
+
+// 用「当前频道表」重算质量分布：进程重启后恢复计数、删除频道后去掉虚高的失效数
+function recountQuality() {
+  if (CHANNEL_CHECK.running) return;
+  const nameOf = new Map(channels.map((c) => [c.id, c.name || c.url || c.id]));
+  let good = 0, fair = 0;
+  const badList = [];
+  for (const [id, r] of CHANNEL_CHECK.quality) {
+    if (!nameOf.has(id)) continue;   // 已删除的频道不计入
+    if (r.state === 'good') good++;
+    else if (r.state === 'fair') fair++;
+    else badList.push({ id, name: nameOf.get(id), reason: r.reason || '不可用', ms: r.ms || 0 });
+  }
+  CHANNEL_CHECK.ok = good;
+  CHANNEL_CHECK.fair = fair;
+  CHANNEL_CHECK.bad = badList;
+  CHANNEL_CHECK.total = good + fair + badList.length;
+}
+
+// 按源汇总质量（源管理页显示「可用率」，一眼看出整条源还值不值得留）
+function qualityBySource() {
+  const map = new Map();
+  for (const c of channels) {
+    const r = CHANNEL_CHECK.quality.get(c.id);
+    if (!r) continue;
+    const sid = c.sourceId || '';
+    let s = map.get(sid);
+    if (!s) { s = { sourceId: sid, checked: 0, good: 0, fair: 0, bad: 0 }; map.set(sid, s); }
+    s.checked++;
+    if (r.state === 'good') s.good++;
+    else if (r.state === 'fair') s.fair++;
+    else s.bad++;
+  }
+  const out = [];
+  for (const [sid, s] of map) {
+    const src = sources.find((x) => x.id === sid);
+    s.name = src ? src.name : (sid || '未知源');
+    s.okRate = s.checked ? Math.round(((s.good + s.fair) / s.checked) * 100) : 0;
+    out.push(s);
+  }
+  return out;
+}
+
 function channelCheckStatus() {
-  return {
+  const st = {
     running: CHANNEL_CHECK.running,
     total: CHANNEL_CHECK.total,
     done: CHANNEL_CHECK.done,
-    ok: CHANNEL_CHECK.ok,
+    ok: CHANNEL_CHECK.ok,                 // 优秀
+    fairCount: CHANNEL_CHECK.fair,
     badCount: CHANNEL_CHECK.bad.length,
     badIds: CHANNEL_CHECK.bad.map((b) => b.id),
     badSample: CHANNEL_CHECK.bad.slice(0, 20),
     startedAt: CHANNEL_CHECK.startedAt,
     finishedAt: CHANNEL_CHECK.finishedAt,
     disableBad: CHANNEL_CHECK.disableBad,
+    qualityAt: CHANNEL_CHECK.qualityAt,
+    sourceStats: qualityBySource(),
   };
+  // 检测中不返回全量结果（每 1.5s 轮询）；结束后前端一次取回做徽标
+  if (!CHANNEL_CHECK.running) st.results = Object.fromEntries(CHANNEL_CHECK.quality);
+  return st;
+}
+
+// 把底层网络错误翻译成用户能看懂的原因（写进 badSample，前端悬浮显示）
+function probeFailReason(e) {
+  const code = (e && e.code) || '';
+  const msg = (e && e.message) || String(e || '');
+  if (code === 'ECONNRESET') return '源站重置连接';
+  if (code === 'ETIMEDOUT' || /timed? ?out|timeout/i.test(msg)) return '访问超时（8s）';
+  if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') return '域名解析失败';
+  if (code === 'ECONNREFUSED') return '源站拒绝连接';
+  if (/aborted|socket hang up/i.test(msg)) return '连接被中止';
+  return '探测失败：' + msg.slice(0, 80);
 }
 
 async function probeChannel(ch) {
-  const UA = { 'User-Agent': 'Mozilla/5.0 (XTE-IPTV/5.2.2; +health-check)' };
+  const t0 = Date.now();
+  const UA = { 'User-Agent': 'Mozilla/5.0 (XTE-IPTV/5.2.3; +quality-check)' };
+  const out = { state: 'bad', reason: '', ms: 0, segMs: 0, bytes: 0, kbps: 0, kind: 'hls' };
+  const fail = (reason) => { out.state = 'bad'; out.reason = reason; out.ms = Date.now() - t0; return out; };
+  const headerInt = (headers, name) => {
+    try { return parseInt(String((headers && headers[name]) || '0').split('/').pop(), 10) || 0; } catch { return 0; }
+  };
   try {
     if (isProgressiveMedia(ch.url)) {
+      out.kind = 'progressive';
       const r = await fetchUpstream(ch.url, { headers: Object.assign({ Range: 'bytes=0-1023' }, UA), timeoutMs: 8000 });
-      const ok = r.status < 400;
+      const st = r.status;
+      const total = headerInt(r.res.headers, 'content-range') || headerInt(r.res.headers, 'content-length');
       try { r.res.destroy(); } catch {}
-      return ok;
+      out.ms = Date.now() - t0;
+      out.bytes = total;
+      if (st >= 400) return fail('首字节 HTTP ' + st);
+      if (out.ms > 4000) { out.state = 'fair'; out.reason = '响应偏慢 ' + (out.ms / 1000).toFixed(1) + 's'; return out; }
+      out.state = 'good';
+      return out;
     }
     const buf = await fetchText(ch.url, UA, 8000);
     const text = buf.toString('utf8');
-    if (!isHlsPlaylistText(text)) return false;
+    if (!isHlsPlaylistText(text)) {
+      const head = text.slice(0, 400);
+      if (/^\s*</.test(head) || /(登录|订阅|过期|失效|无效|forbidden|unauthorized|not found|error)/i.test(head)) {
+        return fail('上游返回网页而不是播放列表（可能需登录或已下线）');
+      }
+      return fail('不是有效的 HLS 播放列表');
+    }
+    const plMs = Date.now() - t0;
     const pl = parseMediaPlaylist(text, ch.url);
     const seg = pl.segs[0];
-    if (!seg) return true; // 空索引（刚起播）也算可用，交给播放时兜底
+    if (!seg) {
+      out.ms = plMs;
+      out.state = 'fair';
+      out.reason = '播放列表暂无可播分片（直播窗口为空）';
+      return out;
+    }
+    const mDur = text.match(/#EXTINF:\s*([\d.]+)/);
+    const dur = mDur ? Number(mDur[1]) : 0;
+    const t1 = Date.now();
     const r2 = await fetchUpstream(seg, { headers: Object.assign({ Range: 'bytes=0-2047' }, UA), timeoutMs: 8000 });
-    const ok = r2.status < 400;
+    const st2 = r2.status;
+    const total = headerInt(r2.res.headers, 'content-range') || headerInt(r2.res.headers, 'content-length');
     try { r2.res.destroy(); } catch {}
-    return ok;
-  } catch {
-    return false;
+    out.ms = Date.now() - t0;
+    out.segMs = Date.now() - t1;
+    out.bytes = total;
+    if (st2 >= 400) return fail('首个分片 HTTP ' + st2);
+    if (dur > 0 && total > 0) out.kbps = Math.round((total * 8) / dur / 1000);
+    if (total > 0 && total < 20000) {
+      out.state = 'fair';
+      out.reason = '分片仅 ' + Math.max(1, Math.round(total / 1024)) + 'KB，可能是不稳定源';
+      return out;
+    }
+    if (out.ms > 3000 || out.segMs > 2000) {
+      out.state = 'fair';
+      out.reason = '响应偏慢（列表 ' + plMs + 'ms / 首片 ' + out.segMs + 'ms）';
+      return out;
+    }
+    out.state = 'good';
+    return out;
+  } catch (e) {
+    return fail(probeFailReason(e));
   }
 }
 
@@ -2297,29 +2510,45 @@ function startChannelCheck(targets, disableBad) {
   CHANNEL_CHECK.total = targets.length;
   CHANNEL_CHECK.done = 0;
   CHANNEL_CHECK.ok = 0;
+  CHANNEL_CHECK.fair = 0;
   CHANNEL_CHECK.bad = [];
   CHANNEL_CHECK.startedAt = Date.now();
   CHANNEL_CHECK.finishedAt = 0;
   CHANNEL_CHECK.disableBad = !!disableBad;
   CHANNEL_CHECK.aborted = false;
+  CHANNEL_CHECK.quality.clear();
   const queue = targets.slice();
-  log('info', '开始频道可用性检测', { total: queue.length, disableBad: !!disableBad });
+  log('info', '开始频道质量检测', { total: queue.length, disableBad: !!disableBad, concurrency: CHANNEL_CHECK.concurrency });
 
   const worker = async () => {
     while (queue.length && !CHANNEL_CHECK.aborted) {
       const ch = queue.shift();
-      let good = false;
-      try { good = await probeChannel(ch); } catch { good = false; }
+      let r;
+      const t0 = Date.now();
+      try {
+        // 单个频道最多 20s：探测内部已有 8s 空闲超时 + 16s 读体超时，这里再兜一层总时限，
+        // 防止个别源站「连上就不吐数据/永久 trickle」把 8 个并发槽位全部占死（批量检测会整批卡住）。
+        r = await Promise.race([
+          probeChannel(ch),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('探测总耗时超过 20s')), 20000).unref()),
+        ]);
+      } catch (e) {
+        r = { state: 'bad', reason: (e && e.message) || '探测异常', ms: Date.now() - t0 };
+      }
       if (CHANNEL_CHECK.aborted) break;
+      r.at = Date.now();
       CHANNEL_CHECK.done++;
-      if (good) CHANNEL_CHECK.ok++;
-      else CHANNEL_CHECK.bad.push({ id: ch.id, name: ch.name || ch.url });
+      CHANNEL_CHECK.quality.set(ch.id, r);
+      if (r.state === 'good') CHANNEL_CHECK.ok++;
+      else if (r.state === 'fair') CHANNEL_CHECK.fair++;
+      else CHANNEL_CHECK.bad.push({ id: ch.id, name: ch.name || ch.url, reason: r.reason || '不可用', ms: r.ms || 0 });
     }
   };
   const n = Math.max(1, Math.min(CHANNEL_CHECK.concurrency, queue.length));
   Promise.all(Array.from({ length: n }, () => worker())).then(() => {
     CHANNEL_CHECK.running = false;
     CHANNEL_CHECK.finishedAt = Date.now();
+    persistCheckResult();
     let disabled = 0;
     if (CHANNEL_CHECK.disableBad && CHANNEL_CHECK.bad.length) {
       const badIds = new Set(CHANNEL_CHECK.bad.map((b) => b.id));
@@ -2328,14 +2557,15 @@ function startChannelCheck(targets, disableBad) {
       }
       if (disabled) persistChannels();
     }
-    log('info', '频道可用性检测完成', {
-      total: CHANNEL_CHECK.total, ok: CHANNEL_CHECK.ok, bad: CHANNEL_CHECK.bad.length,
-      disabled, costMs: CHANNEL_CHECK.finishedAt - CHANNEL_CHECK.startedAt,
+    log('info', '频道质量检测完成', {
+      total: CHANNEL_CHECK.total, good: CHANNEL_CHECK.ok, fair: CHANNEL_CHECK.fair,
+      bad: CHANNEL_CHECK.bad.length, disabled,
+      costMs: CHANNEL_CHECK.finishedAt - CHANNEL_CHECK.startedAt,
     });
   }).catch((e) => {
     CHANNEL_CHECK.running = false;
     CHANNEL_CHECK.finishedAt = Date.now();
-    log('error', '频道可用性检测异常', { error: e.message });
+    log('error', '频道质量检测异常', { error: e.message });
   });
   return queue.length;
 }
@@ -2501,7 +2731,11 @@ async function handleApi(req, res, parsed) {
   }
 
   // 源 CRUD
-  if (p === '/api/sources' && method === 'GET') return sendJson(res, 200, sources);
+  if (p === '/api/sources' && method === 'GET') {
+    // v5.2.3：附带最近一次质量检测的按源汇总（源管理页显示可用率）
+    const qs = new Map(qualityBySource().map((q) => [q.sourceId, q]));
+    return sendJson(res, 200, sources.map((s) => Object.assign({}, s, { quality: qs.get(s.id) || null })));
+  }
   if (p === '/api/sources' && method === 'POST') {
     const body = JSON.parse(await readBody(req));
     if (!body.name) return sendJson(res, 400, { error: 'name required' });
@@ -2566,6 +2800,10 @@ async function handleApi(req, res, parsed) {
     const src = sources.find((s) => s.id === id);
     channels = channels.filter((c) => c.sourceId !== id);
     sources = sources.filter((s) => s.id !== id);
+    // 该源已删，针对它的屏蔽记录也一并清掉（避免 blocked.json 越积越多）
+    const beforeBlocked = blockedChannels.length;
+    blockedChannels = blockedChannels.filter((b) => b.sourceId !== id);
+    if (blockedChannels.length !== beforeBlocked) persistBlocked();
     persistSources(); persistChannels();
     // 删除上传/粘贴落盘的 m3u 备份文件
     if (src && (src.origin === 'upload' || src.origin === 'text')) {
@@ -2606,6 +2844,8 @@ async function handleApi(req, res, parsed) {
     if (CHANNEL_CHECK.running) return sendJson(res, 409, { error: '检测正在进行中', status: channelCheckStatus() });
     const body = JSON.parse(await readBody(req));
     let targets = channels.filter((c) => c.enabled !== false);
+    // v5.2.3：可只检测某一条源（源管理页的「检测该源」）
+    if (body.sourceId) targets = targets.filter((c) => c.sourceId === body.sourceId);
     if (!body.all) {
       const idSet = new Set(Array.isArray(body.ids) ? body.ids : []);
       if (idSet.size) targets = targets.filter((c) => idSet.has(c.id));
@@ -2643,15 +2883,54 @@ async function handleApi(req, res, parsed) {
       targets.forEach((c) => { c.group = g; });
     } else if (body.action === 'delete') {
       const delIds = new Set(targets.map((c) => c.id));
+      // v5.2.3：删除前记进屏蔽名单，否则下次源刷新（默认 30 分钟一次）又会长回来
+      if (body.remember !== false) addBlockedChannels(targets);
       for (let i = channels.length - 1; i >= 0; i--) {
         if (delIds.has(channels[i].id)) channels.splice(i, 1);
       }
+      for (const id of delIds) CHANNEL_CHECK.quality.delete(id);
+      if (!CHANNEL_CHECK.running) { recountQuality(); persistCheckResult(); }
     } else {
       return sendJson(res, 400, { error: 'unknown action' });
     }
     persistChannels();
     log('info', `频道批量操作 action=${body.action} affected=${count} all=${!!body.all}`);
     return sendJson(res, 200, { affected: count, total: channels.length });
+  }
+
+  // v5.2.3 已删除频道的屏蔽名单（源刷新不会把这些地址刷回来）
+  //   GET  → { count, items:[{url,name,sourceId,at}] }
+  //   POST {action:'clear'}              解除全部屏蔽，并重新解析受影响的源
+  //        {action:'restore', urls:[…]}  解除指定地址
+  if (p === '/api/channels/blocked' && method === 'GET') {
+    return sendJson(res, 200, { count: blockedChannels.length, items: blockedChannels.slice(-200).reverse() });
+  }
+  if (p === '/api/channels/blocked' && method === 'POST') {
+    const body = await readBody(req)
+      .then((t) => { try { return JSON.parse(t || '{}'); } catch { return {}; } })
+      .catch(() => ({}));
+    const onlyUrls = Array.isArray(body.urls) ? new Set(body.urls) : null;
+    const before = blockedChannels.length;
+    const affected = new Set();
+    const keep = [];
+    for (const b of blockedChannels) {
+      const hit = onlyUrls ? onlyUrls.has(b.url) : true;
+      if (hit) { if (b.sourceId) affected.add(b.sourceId); }
+      else keep.push(b);
+    }
+    blockedChannels = keep;
+    persistBlocked();
+    // 解除屏蔽后立刻重新解析对应的源，把频道长回来
+    const chBefore = channels.length;
+    for (const sid of affected) {
+      const src = sources.find((x) => x.id === sid);
+      if (!src) continue;
+      try { await refreshSource(src); } catch {}
+    }
+    const restored = Math.max(0, channels.length - chBefore);
+    const removed = before - keep.length;
+    log('info', '解除频道屏蔽', { removed, remainder: blockedChannels.length, restored });
+    return sendJson(res, 200, { removed, count: blockedChannels.length, restored });
   }
 
   // 频道导出：GET /api/channels/export

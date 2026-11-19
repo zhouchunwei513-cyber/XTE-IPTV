@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>XTE-IPTV 直播代理 v5.2.2</title>
+<title>XTE-IPTV 直播代理 v5.2.3</title>
 <style>
   :root{
     --bg:#0e1116; --panel:#161b22; --panel2:#1c232d; --border:#2a323d;
@@ -123,7 +123,7 @@
 <body>
 <div class="app">
   <aside class="side">
-    <div class="logo">XTE-IPTV<small>直播代理 v5.2.2</small></div>
+    <div class="logo">XTE-IPTV<small>直播代理 v5.2.3</small></div>
     <nav class="nav">
       <a data-tab="dash" class="active">仪表盘</a>
       <a data-tab="sources">源管理</a>
@@ -131,7 +131,7 @@
       <a data-tab="settings">系统设置</a>
       <a data-tab="logs">运行日志</a>
     </nav>
-    <div class="ver" id="ver">v5.2.2</div>
+    <div class="ver" id="ver">v5.2.3</div>
   </aside>
 
   <main class="main">
@@ -210,9 +210,15 @@
       <div class="panel">
         <table>
           <thead><tr><th>名称</th><th>地址</th><th>类型</th><th>频道数</th>
-            <th>上次刷新</th><th>状态</th><th>操作</th></tr></thead>
+            <th>上次刷新</th><th>状态</th><th>质量</th><th>操作</th></tr></thead>
           <tbody id="srcBody"></tbody>
         </table>
+      </div>
+      <div class="panel" id="blockedPanel" style="display:none">
+        <h2>已删除的频道</h2>
+        <p class="desc">删除失效频道时会记住它的原始地址（写入 blocked.json），源自动刷新也不会再把它加回来。
+          需要时点「解除全部屏蔽」，系统会立即重新解析这些源，把频道重新导入。</p>
+        <div class="muted" id="blockedBar" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"></div>
       </div>
     </section>
 
@@ -222,7 +228,11 @@
       <div class="toolbar">
         <input id="chSearch" placeholder="搜索名称 / 分组…" oninput="loadChannels()">
         <button class="ghost" onclick="loadChannels()">刷新</button>
-        <button class="ghost" id="chCheckBtn" onclick="checkChannels()" title="逐个探测上游是否可用（先取播放列表，再试拉第一个分片），可一键停用不可用频道">检测可用性</button>
+        <button class="ghost" id="chCheckBtn" onclick="checkChannels()" title="逐个探测上游质量（播放列表 + 首个分片），分为「优秀 / 一般 / 失效」三级，失效项可一键停用或删除">检测源质量</button>
+        <label class="check" id="chOnlyBadBox" style="display:none;align-items:center;gap:6px;margin:0;cursor:pointer">
+          <input type="checkbox" id="chOnlyBad" onchange="loadChannels()"> <span>只看失效</span>
+        </label>
+        <span class="muted" id="chQuality"></span>
         <span class="muted" id="chCount"></span>
       </div>
       <div class="toolbar bulk-bar">
@@ -240,7 +250,7 @@
       </div>
       <div class="panel" style="padding:0">
         <table>
-          <thead><tr><th style="width:36px"><input type="checkbox" id="chSelectAllHead"></th><th>台标</th><th>名称</th><th>分组</th><th>TVG-ID</th>
+          <thead><tr><th style="width:36px"><input type="checkbox" id="chSelectAllHead"></th><th>台标</th><th>名称</th><th>分组</th><th>TVG-ID</th><th style="width:96px">质量</th>
             <th style="width:120px">操作</th></tr></thead>
           <tbody id="chBody"></tbody>
         </table>
@@ -621,7 +631,7 @@ function onSrcFilePick() {
 async function loadSources() {
   const list = await API.sources();
   const body = document.getElementById('srcBody');
-  if (!list.length) { body.innerHTML = '<tr><td colspan="7" class="muted" style="text-align:center;padding:24px">暂无播放源，请在上方添加</td></tr>'; return; }
+  if (!list.length) { body.innerHTML = '<tr><td colspan="8" class="muted" style="text-align:center;padding:24px">暂无播放源，请在上方添加</td></tr>'; renderBlocked(); return; }
   const originLabel = (s) => {
     if (s.origin === 'upload') return '<span class="badge">本地上传</span>';
     if (s.origin === 'text') return '<span class="badge">文本粘贴</span>';
@@ -638,10 +648,53 @@ async function loadSources() {
       ? '<span class="badge err" title="'+esc(s.error)+'">失败</span>' +
         '<div class="muted" style="font-size:12px;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:4px" title="'+esc(s.error)+'">'+esc(s.error.length>40?s.error.slice(0,40)+'…':s.error)+'</div>'
       : '<span class="badge direct">正常</span>'}</td>
+    <td>${qualityCell(s.quality)}</td>
     <td>
+      <button class="ghost sm" onclick="checkSource('${s.id}')" title="只检测该源里的启用频道">检测</button>
       <button class="ghost sm" onclick="refreshSrc('${s.id}')">刷新</button>
       <button class="danger sm" onclick="delSrc('${s.id}')">删除</button>
     </td></tr>`).join('');
+  renderBlocked();
+}
+
+// 源质量单元格：优先显示「可用率」，鼠标悬浮看优秀/一般/失效明细
+function qualityCell(q) {
+  if (!q || !q.checked) return '<span class="muted">未检测</span>';
+  const cls = q.okRate >= 90 ? 'direct' : q.okRate >= 60 ? 'warn' : 'err';
+  return '<span class="badge ' + cls + '" title="优秀 ' + q.good + ' / 一般 ' + q.fair + ' / 失效 ' + q.bad + '（已检测 ' + q.checked + ' 个）">' + q.okRate + '% 可用</span>' +
+    '<div class="muted" style="font-size:11px;margin-top:4px">优 ' + q.good + ' · 一般 ' + q.fair + ' · 失效 ' + q.bad + '</div>';
+}
+
+// 只检测某一条源（源管理页按钮）
+async function checkSource(id) {
+  const st = await (await fetch('/api/channels/check')).json();
+  if (st.running) { alert('已有检测在进行中，请等它结束。'); pollCheck(); return; }
+  if (!confirm('将检测该源里所有启用的频道（并发 8，500 个约 1~3 分钟），期间可正常观看。开始吗？')) return;
+  const r = await fetch('/api/channels/check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ all: true, sourceId: id }) });
+  const d = await r.json();
+  if (!r.ok) return alert(d.error || '检测启动失败');
+  pollCheck();
+}
+
+// 已删除（屏蔽）的频道：数量 + 解除入口
+async function renderBlocked() {
+  const panel = document.getElementById('blockedPanel');
+  const bar = document.getElementById('blockedBar');
+  if (!panel || !bar) return;
+  let d;
+  try { d = await (await fetch('/api/channels/blocked')).json(); } catch { return; }
+  if (!d || !d.count) { panel.style.display = 'none'; bar.innerHTML = ''; return; }
+  panel.style.display = '';
+  bar.innerHTML = '已屏蔽 <b>' + d.count + '</b> 个失效频道（源刷新不会恢复）' +
+    '<button class="ghost sm" onclick="restoreBlocked()">解除全部屏蔽</button>';
+}
+async function restoreBlocked() {
+  if (!confirm('解除全部屏蔽？系统会立即重新解析受影响的源，被删掉的失效频道会重新出现。')) return;
+  const r = await fetch('/api/channels/blocked', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'clear' }) });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) return alert('解除失败：' + (d.error || r.status));
+  alert('已解除 ' + (d.removed || 0) + ' 条屏蔽，重新导入 ' + (d.restored || 0) + ' 个频道。');
+  loadSources(); loadChannels();
 }
 async function addSource() {
   const name = document.getElementById('srcName').value.trim();
@@ -689,19 +742,62 @@ async function delSrc(id) {
 
 // channels
 let allChannels = [];
+let qualityMap = {};        // id -> { state, reason, ms, segMs, bytes, kbps, kind, at }
+let qualityStats = null;    // 最近一次 /api/channels/check 的汇总
+let qualityAt = 0;
+async function loadQuality(force) {
+  if (!force && Date.now() - qualityAt < 4000) return;
+  try {
+    const st = await (await fetch('/api/channels/check')).json();
+    qualityMap = st.results || {};
+    qualityStats = st;
+    qualityAt = Date.now();
+  } catch {}
+}
+function qualityBadge(id) {
+  const q = qualityMap[id];
+  if (!q) return '<span class="muted">-</span>';
+  const cls = q.state === 'good' ? 'direct' : q.state === 'fair' ? 'warn' : 'err';
+  const label = q.state === 'good' ? '优秀' : q.state === 'fair' ? '一般' : '失效';
+  const bits = [q.reason || '', q.ms ? q.ms + 'ms' : '', q.kbps ? q.kbps + 'kbps' : ''].filter(Boolean).join(' · ');
+  return '<span class="badge ' + cls + '" title="' + esc(bits) + '">' + label + '</span>';
+}
+function renderQualitySummary() {
+  const el = document.getElementById('chQuality');
+  const box = document.getElementById('chOnlyBadBox');
+  const has = !!(qualityStats && qualityStats.qualityAt);
+  if (box) box.style.display = has ? 'flex' : 'none';
+  if (!el) return;
+  if (!has) { el.textContent = '未检测过质量'; return; }
+  const t = new Date(qualityStats.qualityAt);
+  const hh = String(t.getHours()).padStart(2, '0'), mm = String(t.getMinutes()).padStart(2, '0');
+  el.innerHTML = '上次检测 ' + (t.getMonth() + 1) + '-' + t.getDate() + ' ' + hh + ':' + mm +
+    '：<b>优秀 ' + (qualityStats.ok || 0) + '</b> · 一般 ' + (qualityStats.fairCount || 0) +
+    ' · <b style="color:var(--err)">失效 ' + (qualityStats.badCount || 0) + '</b>';
+}
 async function loadChannels() {
   const q = document.getElementById('chSearch').value;
+  await loadQuality();
   const data = await API.channels(q);
   allChannels = data.items;
   document.getElementById('chCount').textContent = `共 ${data.total} 个频道`;
+  renderQualitySummary();
+  const onlyBad = document.getElementById('chOnlyBad');
+  let rows = allChannels;
+  if (onlyBad && onlyBad.checked) rows = rows.filter((c) => (qualityMap[c.id] || {}).state === 'bad');
   const body = document.getElementById('chBody');
-  if (!allChannels.length) { body.innerHTML = '<tr><td colspan="6" class="muted" style="text-align:center;padding:24px">暂无频道，请先在「源管理」添加播放源</td></tr>'; updateSelCount(); return; }
-  body.innerHTML = allChannels.map(c => `<tr${c.enabled === false ? ' style="opacity:.5"' : ''}>
+  if (!rows.length) {
+    body.innerHTML = '<tr><td colspan="7" class="muted" style="text-align:center;padding:24px">' +
+      (allChannels.length ? '当前筛选没有「失效」频道' : '暂无频道，请先在「源管理」添加播放源') + '</td></tr>';
+    syncHeadCheck(); updateSelCount(); return;
+  }
+  body.innerHTML = rows.map(c => `<tr${c.enabled === false ? ' style="opacity:.5"' : ''}>
     <td><input type="checkbox" class="ch-cb" data-id="${esc(c.id)}" onchange="updateSelCount();syncHeadCheck()"></td>
     <td>${c.logo ? `<img class="logo-img" src="${esc(c.logo)}" referrerpolicy="no-referrer" onerror="this.outerHTML='<span class=\\'logo-ph\\'>📺</span>'">` : `<span class="logo-ph">📺</span>`}</td>
     <td><div class="chan-name"><span><b>${esc(c.name)}</b>${c.enabled === false ? ' <span class="badge warn">已停用</span>' : ''}</span></div></td>
     <td class="grp">${esc(c.group || '-')}</td>
     <td class="muted">${esc(c.tvgId || '-')}</td>
+    <td>${qualityBadge(c.id)}</td>
     <td><button class="ghost sm" onclick='editCh(${JSON.stringify(c).replace(/'/g,"&#39;")})'>编辑</button></td>
   </tr>`).join('');
   syncHeadCheck();
@@ -738,14 +834,14 @@ function toggleSelectAll(src) {
   document.querySelectorAll('.ch-cb').forEach(cb => { cb.checked = on; });
   updateSelCount();
 }
-// 频道可用性检测：启动后台探测 → 轮询进度 → 结束后可一键停用不可用频道
+// 频道质量检测（v5.2.3）：启动后台探测 → 轮询进度 → 结束后可一键停用/删除失效频道
 let checkTimer = null;
 async function checkChannels() {
   const st = await (await fetch('/api/channels/check')).json();
   if (st.running) { pollCheck(); return; }
   const q = document.getElementById('chSearch').value.trim();
   const scope = q ? `当前搜索结果（关键词「${q}」）里的启用频道` : '全部启用频道';
-  if (!confirm(`将逐个探测${scope}的上游是否可用（并发 6，1000 个频道约 3~8 分钟）。\n检测期间仍可正常观看，只是会占用一些出口带宽。\n\n开始检测？`)) return;
+  if (!confirm(`将逐个探测${scope}的上游质量（播放列表 + 首个分片，并发 8，1000 个约 2~5 分钟）。\n分为「优秀 / 一般 / 失效」三级，期间可正常观看，只是会占用一些出口带宽。\n\n开始检测？`)) return;
   const payload = { all: true };
   if (q) payload.q = q;
   const r = await fetch('/api/channels/check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
@@ -759,19 +855,24 @@ async function pollCheck() {
   const tick = async () => {
     let st;
     try { st = await (await fetch('/api/channels/check')).json(); } catch { return; }
-    if (btn) btn.textContent = st.running ? `检测中 ${st.done}/${st.total}` : '检测可用性';
+    if (btn) btn.textContent = st.running ? `检测中 ${st.done}/${st.total}` : '检测源质量';
     if (st.running) return;
     clearInterval(checkTimer); checkTimer = null;
+    await loadQuality(true);
     await loadChannels();
-    const msg = `检测完成：可用 ${st.ok} / 共 ${st.total}，不可用 ${st.badCount}。`;
-    if (!st.badCount) { alert(msg); return; }
-    if (confirm(msg + '\n\n是否把不可用频道批量停用（从播放列表隐藏，可随时重新启用）？')) {
-      const r = await fetch('/api/channels/batch', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ids: st.badIds, action: 'disable' }),
-      });
-      if (r.ok) { await loadChannels(); alert(`已停用 ${st.badCount} 个不可用频道。`); }
+    loadSources();
+    const msg = `检测完成：优秀 ${st.ok} · 一般 ${st.fairCount || 0} · 失效 ${st.badCount}（共 ${st.total}）`;
+    if (!st.badCount) { alert(msg + '\n\n没有发现失效频道。'); return; }
+    const sample = (st.badSample || []).slice(0, 5).map((b) => '· ' + b.name + '：' + (b.reason || '不可用')).join('\n');
+    if (confirm(msg + (sample ? '\n\n失效示例：\n' + sample : '') + '\n\n是否把失效频道批量停用（从播放列表隐藏，可随时重新启用）？')) {
+      const r = await fetch('/api/channels/batch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids: st.badIds, action: 'disable' }) });
+      if (r.ok) { await loadChannels(); alert(`已停用 ${st.badCount} 个失效频道。`); }
       else alert('停用失败，请重试');
+    }
+    if (confirm(`是否把这 ${st.badCount} 个失效频道删除？\n\n删除会记入屏蔽名单（blocked.json），源自动刷新不会再恢复；需要时可到「源管理」页点「解除全部屏蔽」找回。`)) {
+      const r2 = await fetch('/api/channels/batch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids: st.badIds, action: 'delete' }) });
+      if (r2.ok) { await loadChannels(); loadSources(); alert(`已删除 ${st.badCount} 个失效频道（源刷新不会恢复）。`); }
+      else alert('删除失败，请重试');
     }
   };
   btn && (btn.textContent = '检测中…');

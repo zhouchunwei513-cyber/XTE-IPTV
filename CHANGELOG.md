@@ -1,5 +1,51 @@
 # 更新日志
 
+## v5.2.3 (2026-11-19) — 检测源质量 + 失效频道可删除
+
+用户需求：「优化检测源质量的功能，失效的源加入删除功能」。原实现的两个缺口：
+1. 探测只产出 true/false，用户不知道「为什么不可用」，也不知道「能播但很卡的弱源」；
+2. 失效频道只能停用；即便手动删除，`refreshSource()` 也会在下一次自动刷新（默认 30 分钟）时
+   按源文件原样重建，删除等于没删 —— 因为没有「墓碑」机制。
+
+### 后端
+
+- **质量探测三级** `probeChannel()` 改写为返回对象：`{state:'good'|'fair'|'bad', reason, ms, segMs, bytes, kbps, kind, at}`
+  - `good`：播放列表与首个分片都在 3s 内返回，首片体积正常；
+  - `fair`：能播但响应偏慢（列表 >3s 或首片 >2s）、首片 <20KB、播放列表暂无分片（直播窗口为空）；
+  - `bad`：取不到播放列表、返回 HTML/错误页、首个分片 4xx/5xx、连接重置、超时、域名解析失败等。
+  - 附带 `ms`（总耗时）、`segMs`（首片耗时）、`bytes`（分片体积，取自 `Content-Range`）、
+    `kbps`（按 `#EXTINF` 时长估算码率）、`reason`（中文可读原因，新增 `probeFailReason()` 翻译底层错误码）。
+- **结果持久化**：检测结果写入 `DATA_DIR/check.json`（`{at, results:[[id, r], …]}`，上限 8000 条），
+  启动时恢复，重启后频道列表仍能显示质量徽标。
+- **按源汇总** `qualityBySource()`：`/api/sources` 每条源附带 `quality:{checked,good,fair,bad,okRate,name}`；
+  `/api/channels/check` 附带 `sourceStats`。
+- **屏蔽名单（墓碑）**：新增 `DATA_DIR/blocked.json`，`addBlockedChannels()` 按原始 URL 记录删除过的频道；
+  `refreshSource()` 解析后先过滤这些地址并在日志里给出 `skippedByBlock`，彻底解决「删完又被刷回来」。
+  上限 20000 条；删除源时连带清理该源的屏蔽记录。
+- **新接口**：
+  - `GET /api/channels/blocked` → `{count, items:[{url,name,sourceId,at}]}`
+  - `POST /api/channels/blocked {action:'clear'}` 或 `{action:'restore', urls:[…]}` → 解除屏蔽并立即重新解析受影响的源，返回 `{removed,count,restored}`
+  - `POST /api/channels/check` 新增 `sourceId`（只检测某一条源）
+  - `POST /api/channels/batch` 的 `delete` 现在自动写墓碑（可用 `remember:false` 关闭）
+- 检测并发 6 → 8，检测 UA 改为 `XTE-IPTV/5.2.3; +quality-check`。
+- **顺带修掉两个回源层老 bug**（做批量检测时被放大，暴露出来）：
+  1. **http→https 重定向后请求无效**：`fetchUpstream()` 的 `lib`/`agent` 按最初的 URL 选定，
+     递归跟随 301/302 到 https 时仍用 `http` 模块，抛 `ERR_INVALID_PROTOCOL`——而这个异常发生在响应回调里，
+     promise 既不 resolve 也不 reject，请求一直挂到 socket 超时。运营商源「301 到 https」非常常见，
+     表现为「明明能播却被判失效/超时」。改为**按每一跳的协议重新选择 lib/agent**，并给 `lib.request()` 加
+     try/catch（同步异常一律转 reject）。实测某山西频道 8s 超时 → 401ms 优秀。
+  2. **`fetchText()` 可能永久悬挂**：原先只有 socket 空闲超时，遇到「隔几秒吐几个字节、永不结束」的网页/伪 m3u8
+     会一直读下去（批量检测时 8 个 worker 全部卡死，进度停在 716/1230）。新增**硬总时长**（≥2× 空闲超时）
+     与 **8MB 体积上限**，并监听 `aborted`/`close`；`startChannelCheck` 的 worker 再加一层 20s 总时限兜底。
+
+### 前端
+
+- 频道管理：「检测可用性」→「检测源质量」，新增质量列（优秀/一般/失效徽标，悬浮显示原因/耗时/码率）、
+  顶部统计（上次检测时间 + 三级数量）、「只看失效」筛选；
+  检测完成后依次询问「停用失效」「删除失效」，删除会明确提示「源刷新不会恢复，可在源管理页找回」。
+- 源管理：新增「质量」列（可用率徽标 + 优/一般/失效明细）、每条源的「检测」按钮、
+  新增「已删除的频道」面板（已屏蔽数量 + 解除全部屏蔽）。
+
 ## v5.2.2 (2026-11-17) — 内存泄漏治理（RSS 6.3GB）
 
 现场：飞牛 NAS 连续运行 13h50m 后，`node server/main.js` 的 RSS 达 **6,624,732 kB（6.32GB）**，

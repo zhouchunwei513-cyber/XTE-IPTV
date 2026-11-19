@@ -1,8 +1,48 @@
-# XTE-IPTV 直播代理 (FPK) v5.2.2
+# XTE-IPTV 直播代理 (FPK) v5.2.3
 
 ## 项目概览
 飞牛 NAS 上的 IPTV 直播代理服务。输出标准 HLS (m3u8 + TS)，无转码。
-- **v5.2.2（当前）：内存泄漏治理（现场 RSS 6.32GB，heap 仅 74MB）**
+- **v5.2.3（当前）：检测源质量（三级）+ 失效频道可删除（墓碑屏蔽名单）**
+  - **需求**：用户「优化检测源质量的功能，失效的源加入删除功能」。旧实现两个缺口：①探测只产出 true/false，
+    用户既不知道「为什么不可用」，也看不到「能播但很卡的弱源」；②失效频道只能停用，手动删掉后
+    `refreshSource()` 30 分钟自动刷新会按源原样重建 —— **删除等于没删**（无墓碑机制）。
+  - **① 三级质量探测**：`probeChannel(ch)` 改为返回 `{state:'good'|'fair'|'bad', reason, ms, segMs, bytes, kbps, kind, at}`。
+    `good`=列表与首个分片都在 3s 内且分片体积正常；`fair`=能播但慢（列表 >3s 或首片 >2s）、首片 <20KB、
+    播放列表暂无分片（直播窗口空）；`bad`=取不到列表 / 返回 HTML 错误页 / 首片 4xx-5xx / 连接重置 / 超时 / 域名解析失败。
+    `reason` 由新增 `probeFailReason()` 把底层错误码翻成中文；`kbps` 按 `#EXTINF` 时长 + `Content-Range` 总长估算。
+    **不要把探测改回只返回布尔值**，前端徽标与「失败原因」都依赖这些字段。
+  - **② 结果持久化**：写入 `DATA_DIR/check.json`（`{at, results:[[id, r], …]}`，上限 8000 条），启动时
+    `restoreLastCheck()` 恢复 → 重启后频道列表仍显示质量徽标。检测并发 6→8，UA `XTE-IPTV/5.2.3; +quality-check`。
+  - **③ 墓碑屏蔽名单（关键）**：新增 `DATA_DIR/blocked.json`（`addBlockedChannels()/blockedUrlSet()/persistBlocked()`，
+    上限 20000 条）。`refreshSource()` 解析后先过滤名单内 URL，并在返回值/日志里给 `skippedByBlock` —— 这是
+    保证「删除的频道不会被自动刷新刷回来」的唯一机制，**任何绕过它的频道重建路径都会让删除功能失效**。
+    `DELETE /api/sources/:id` 会连带清理该源的屏蔽记录。
+  - **④ 接口**：`GET /api/channels/blocked`（`{count, items}`）、`POST /api/channels/blocked`
+    （`{action:'clear'}` 或 `{urls:[…]}` → 解除并立即 `refreshSource` 受影响的源，返回 `{removed,count,restored}`，
+    `restored` 用频道数差值算）；`POST /api/channels/check` 支持 `sourceId` 只检测某条源；
+    `POST /api/channels/batch` 的 `delete` 自动写墓碑（`remember:false` 可关）；`/api/sources` 每条源附带
+    `quality:{checked,good,fair,bad,okRate}`（由 `qualityBySource()` 汇总）。
+  - **⑤ 前端**：频道页「检测可用性」→「检测源质量」，新增质量列徽标（悬浮显示原因/耗时/码率）、
+    顶部「上次检测时间 + 优秀/一般/失效」统计、「只看失效」筛选；检测完成后依次询问「停用失效」「删除失效」
+    （删除会提示已写入屏蔽名单、可在源管理页找回）。源管理页新增质量列（可用率徽标）与每行「检测」按钮，
+    以及「已删除的频道」面板（已屏蔽数量 + 解除全部屏蔽）。
+  - **⑥ 实测**：24 频道抽样 9.0s → 优秀 17 / 一般 1 / 失效 6（「域名解析失败」「访问超时（8s）」
+    「不是有效的 HLS 播放列表」「分片仅 1KB」）；删除 6 个失效后刷新两源 `skippedByBlock`=1/5，频道数保持 1224
+    **未复活**；解除屏蔽后回到 1230；重启后质量结果仍从 check.json 恢复。
+  - **⑦ 顺手修掉的回源层老 bug（重要）**：
+    ① `fetchUpstream()` 原先按**最初 URL** 选 `lib`/`agent`，跟随 http→https 重定向时仍用 `http` 模块 →
+    抛 `ERR_INVALID_PROTOCOL`，且异常发生在响应回调里 → **promise 既不 resolve 也不 reject**，请求挂到 socket 超时；
+    运营商源大量「301 到 https」，表现为「能播却判失效」。现在**按每一跳协议重选 lib/agent**，并给
+    `lib.request()` 包 try/catch（同步异常转 reject）。**改这块代码时必须保持逐跳选择。**
+    ② `fetchText()` 增加硬总时长（≥2× 空闲超时）+ 8MB 体积上限 + `aborted/close` 监听，
+    防止「永久 trickle」的伪 m3u8 把刷新/检测挂死；检测 worker 另有 20s 总时限。
+  - **⑧ 实测（全量 1230 频道，约 3~4 分钟，并发 8）**：优秀 830 / 一般 51 / 失效 349；
+    原因分布：访问超时 103、不是有效 HLS 81、返回网页 58、upstream status 47、域名解析失败 23、
+    连接中止 15、首片 4xx/5xx 12；按源可用率：大苏打 89%、大苏打的 63%。
+    抽样 24 频道 9.0s：优秀 17 / 一般 1 / 失效 6；删除 6 个失效后刷新两源 `skippedByBlock`=1/5、
+    频道数保持 1224 **未复活**；解除屏蔽后回到 1230；重启后质量结果仍从 check.json 恢复。
+
+- **v5.2.2：内存泄漏治理（现场 RSS 6.32GB，heap 仅 74MB）**
   - **现场证据**：飞牛上运行 13h50m 后 RSS 6,624,732kB、`VmData` 6.9GB、34500 端口活动连接 **0**；
     日志汇总行 `memRSS_MB` 2.3~2.4GB 而 `memHeap_MB` 仅 74MB → **堆外 Buffer 滞留**，不是 JS 堆泄漏。
     最后一个会话 `北京卫视4K`（4K 单分片 50~54MB）`hit` 恒为 0、`miss` 142 → 大分片缓存纯占内存、零收益。
